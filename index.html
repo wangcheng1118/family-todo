@@ -137,13 +137,16 @@
     .nav-bar { background: rgba(28, 28, 30, 0.72); }
   }
   .nav-bar .list-title {
-    font-size: 28px;
+    font-size: 22px;
     font-weight: 700;
     letter-spacing: -0.5px;
     background: linear-gradient(135deg, var(--text) 0%, var(--text-secondary) 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .nav-bar .icons {
     display: flex;
@@ -169,6 +172,19 @@
     transform: scale(0.92);
     box-shadow: none;
     background: var(--gray5);
+  }
+  .nav-icon-btn-sm {
+    width: 32px;
+    height: 32px;
+  }
+
+  .sync-indicator-sm {
+    width: 32px;
+    height: 32px;
+  }
+  .sync-indicator-sm .sync-dot {
+    width: 10px;
+    height: 10px;
   }
 
   /* Sync indicator */
@@ -997,14 +1013,16 @@
 
 <!-- Navigation Bar -->
 <div class="nav-bar">
-  <div style="display:flex; align-items:center; gap:12px;">
-    <button class="nav-icon-btn" id="menuBtn" style="font-size:18px;">☰</button>
-    <div style="flex:1;">
+  <div style="display:flex; align-items:center; gap:10px;">
+    <button class="nav-icon-btn nav-icon-btn-sm" id="menuBtn" style="font-size:17px;">☰</button>
+    <div style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
       <div class="list-title" id="listTitle">家庭清单</div>
     </div>
-    <button class="nav-icon-btn" id="shareBtn" style="font-size:16px;">↗</button>
-    <div class="sync-indicator offline" id="syncIndicator" title="连接中...">
-      <span class="sync-dot"></span>
+    <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+      <button class="nav-icon-btn nav-icon-btn-sm" id="shareBtn" style="font-size:15px;">↗</button>
+      <div class="sync-indicator sync-indicator-sm offline" id="syncIndicator" title="连接中...">
+        <span class="sync-dot"></span>
+      </div>
     </div>
   </div>
 </div>
