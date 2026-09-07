@@ -11,8 +11,40 @@
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icon-180.png">
 <title>家庭待办</title>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script>
+  // Async Firebase loader - doesn't block page render
+  window.firebaseLoaded = false;
+  function loadFirebase() {
+    const scripts = [
+      'https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js',
+      'https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js'
+    ];
+    let loaded = 0;
+    scripts.forEach(src => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.async = true;
+      s.onload = () => {
+        loaded++;
+        if (loaded === scripts.length) {
+          window.firebaseLoaded = true;
+          if (window.onFirebaseReady) window.onFirebaseReady();
+        }
+      };
+      s.onerror = () => {
+        console.warn('Firebase script failed to load:', src);
+        if (window.onFirebaseError) window.onFirebaseError();
+      };
+      document.head.appendChild(s);
+    });
+    // Timeout fallback - if Firebase doesn't load in 5s, give up
+    setTimeout(() => {
+      if (!window.firebaseLoaded && window.onFirebaseError) {
+        window.onFirebaseError();
+      }
+    }, 5000);
+  }
+</script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   :root {
@@ -2245,20 +2277,41 @@
 
   // ============= Init =============
   function init() {
-    bindEvents();
-    render();
-    
-    // Set up room
-    ensureRoom();
-    
-    // Init Firebase
-    if (typeof firebase !== 'undefined') {
+    try {
+      bindEvents();
+      render();
+      
+      // Set up room
+      ensureRoom();
+      
+      // Start loading Firebase async (UI renders first)
+      window.onFirebaseReady = function() {
+        safeInitFirebase();
+      };
+      window.onFirebaseError = function() {
+        setSyncStatus('offline');
+      };
+      loadFirebase();
+      
+      checkImportOnLoad();
+    } catch(e) {
+      console.error('Init error:', e);
+      // Fallback: try to at least render something
+      try { render(); } catch(e2) {}
+    }
+  }
+
+  function safeInitFirebase() {
+    try {
+      if (typeof firebase === 'undefined') {
+        setSyncStatus('offline');
+        return;
+      }
       initFirebase();
-    } else {
+    } catch(e) {
+      console.warn('Firebase init failed completely:', e);
       setSyncStatus('offline');
     }
-    
-    checkImportOnLoad();
   }
 
   if (document.readyState === 'loading') {
