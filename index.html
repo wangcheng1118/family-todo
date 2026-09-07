@@ -187,41 +187,32 @@
     height: 10px;
   }
 
-  /* Sync indicator */
-  .sync-indicator {
-    width: 36px;
-    height: 36px;
-    border-radius: 50%;
-    background: var(--surface);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: var(--shadow-sm);
-    transition: all 0.3s;
-    flex-shrink: 0;
-    border: 1px solid var(--gray3);
-  }
-  .sync-dot {
+  /* Sync indicator badge (on share button) */
+  .sync-badge {
+    position: absolute;
+    top: -2px;
+    right: -2px;
     width: 12px;
     height: 12px;
     border-radius: 50%;
-    background: var(--gray);
+    background: var(--red);
+    border: 2px solid var(--surface);
     transition: all 0.3s;
+    z-index: 2;
   }
-  .sync-indicator.syncing .sync-dot {
+  .sync-badge.syncing {
     background: var(--orange);
-    animation: syncPulse 1s ease-in-out infinite;
+    animation: badgePulse 1s ease-in-out infinite;
   }
-  .sync-indicator.synced .sync-dot {
+  .sync-badge.synced {
     background: var(--green);
-    box-shadow: 0 0 0 3px rgba(52, 199, 89, 0.2);
   }
-  .sync-indicator.offline .sync-dot {
+  .sync-badge.offline {
     background: var(--red);
   }
-  @keyframes syncPulse {
-    0%, 100% { transform: scale(1); opacity: 1; }
-    50% { transform: scale(1.3); opacity: 0.7; }
+  @keyframes badgePulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.3); }
   }
 
   /* Main scroll area */
@@ -1018,11 +1009,9 @@
     <div style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
       <div class="list-title" id="listTitle">家庭清单</div>
     </div>
-    <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+    <div style="position:relative; flex-shrink:0;">
       <button class="nav-icon-btn nav-icon-btn-sm" id="shareBtn" style="font-size:15px;">↗</button>
-      <div class="sync-indicator sync-indicator-sm offline" id="syncIndicator" title="连接中...">
-        <span class="sync-dot"></span>
-      </div>
+      <div class="sync-badge offline" id="syncIndicator" title="连接中..."></div>
     </div>
   </div>
 </div>
@@ -1339,7 +1328,7 @@
     syncStatus = status;
     const el = document.getElementById('syncIndicator');
     if (!el) return;
-    el.className = 'sync-indicator ' + status;
+    el.className = 'sync-badge ' + status;
     const titles = { offline: '离线模式', syncing: '同步中...', synced: '已同步' };
     el.title = titles[status] || status;
   }
