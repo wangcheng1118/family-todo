@@ -11,6 +11,8 @@
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icon-180.png">
 <title>家庭待办</title>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   :root {
@@ -135,6 +137,41 @@
     transform: scale(0.92);
     box-shadow: none;
     background: var(--gray5);
+  }
+
+  /* Sync indicator */
+  .sync-indicator {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--surface);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: var(--shadow-sm);
+    transition: all 0.3s;
+  }
+  .sync-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--gray);
+    transition: all 0.3s;
+  }
+  .sync-indicator.syncing .sync-dot {
+    background: var(--orange);
+    animation: syncPulse 1s ease-in-out infinite;
+  }
+  .sync-indicator.synced .sync-dot {
+    background: var(--green);
+    box-shadow: 0 0 0 3px rgba(52, 199, 89, 0.2);
+  }
+  .sync-indicator.offline .sync-dot {
+    background: var(--red);
+  }
+  @keyframes syncPulse {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.3); opacity: 0.7; }
   }
 
   /* Main scroll area */
@@ -932,6 +969,9 @@
       <div class="list-title" id="listTitle">家庭清单</div>
     </div>
     <button class="nav-icon-btn" id="shareBtn" style="font-size:16px;">↗</button>
+    <div class="sync-indicator" id="syncIndicator" title="同步中">
+      <span class="sync-dot"></span>
+    </div>
   </div>
 </div>
 
@@ -1078,8 +1118,8 @@
       <div class="share-section">
         <div class="share-icon-wrap">🔗</div>
         <div style="font-size:18px; font-weight:700; margin-bottom:6px; letter-spacing:-0.3px;">通过链接分享</div>
-        <div style="font-size:14px; color:var(--text-secondary); margin-bottom:20px; line-height:1.5;">
-          家人打开链接即可加入这个共享清单
+        <div id="shareDesc" style="font-size:14px; color:var(--text-secondary); margin-bottom:20px; line-height:1.5;">
+          家人打开链接加入后，所有人实时同步
         </div>
         <div class="share-link-box" id="shareLinkBox"></div>
         <button class="share-btn-primary" id="copyLinkBtn">复制链接</button>
@@ -1197,17 +1237,158 @@
   let selectedColor = 'blue';
   let selectedIcon = '📋';
 
-  // ============= Storage =============
+  // ============= Firebase Config =============
+  const firebaseConfig = {
+    apiKey: "AIzaSyBD_NpEquiGGLJNnRDygY1xgQNLCEIugwI",
+    authDomain: "family-todo-5768a.firebaseapp.com",
+    databaseURL: "https://family-todo-5768a-default-rtdb.firebaseio.com",
+    projectId: "family-todo-5768a",
+    storageBucket: "family-todo-5768a.firebasestorage.app",
+    messagingSenderId: "381040860487",
+    appId: "1:381040860487:web:08624dbc640efe357dc062"
+  };
+
+  let firebaseApp = null;
+  let firebaseDb = null;
+  let currentRoomId = null;
+  let isOnline = false;
+  let syncStatus = 'offline'; // offline, syncing, synced
+  let isLocalChange = false; // prevent loop when applying remote changes
+
+  function initFirebase() {
+    try {
+      firebaseApp = firebase.initializeApp(firebaseConfig);
+      firebaseDb = firebase.database();
+      
+      // Check connection status
+      const connectedRef = firebaseDb.ref('.info/connected');
+      connectedRef.on('value', (snap) => {
+        isOnline = snap.val() === true;
+        if (isOnline) {
+          if (currentRoomId) {
+            setSyncStatus('syncing');
+            subscribeToRoom(currentRoomId);
+          } else {
+            setSyncStatus('synced');
+          }
+        } else {
+          setSyncStatus('offline');
+        }
+      });
+      return true;
+    } catch(e) {
+      console.warn('Firebase init failed:', e);
+      setSyncStatus('offline');
+      return false;
+    }
+  }
+
+  function setSyncStatus(status) {
+    syncStatus = status;
+    const el = document.getElementById('syncIndicator');
+    if (!el) return;
+    el.className = 'sync-indicator ' + status;
+    const titles = { offline: '离线模式', syncing: '同步中...', synced: '已同步' };
+    el.title = titles[status] || status;
+  }
+
+  function generateRoomId() {
+    return 'room_' + Math.random().toString(36).substring(2, 10);
+  }
+
+  function getRoomIdFromUrl() {
+    const hash = location.hash;
+    const match = hash.match(/#room=([a-zA-Z0-9_-]+)/);
+    return match ? match[1] : null;
+  }
+
+  function ensureRoom() {
+    // Try to get room from URL first
+    const urlRoom = getRoomIdFromUrl();
+    if (urlRoom) {
+      currentRoomId = urlRoom;
+      return;
+    }
+    // Try localStorage
+    const savedRoom = localStorage.getItem('familyTodoRoom');
+    if (savedRoom) {
+      currentRoomId = savedRoom;
+      return;
+    }
+    // Generate new room
+    currentRoomId = generateRoomId();
+    localStorage.setItem('familyTodoRoom', currentRoomId);
+  }
+
+  function subscribeToRoom(roomId) {
+    if (!firebaseDb || !roomId) return;
+    
+    const roomRef = firebaseDb.ref('rooms/' + roomId);
+    
+    roomRef.on('value', (snapshot) => {
+      if (isLocalChange) return; // ignore changes we just wrote
+      
+      const remoteData = snapshot.val();
+      if (remoteData && remoteData.lists) {
+        // Remote data exists - merge/use it
+        const localUpdatedAt = state.updatedAt || 0;
+        const remoteUpdatedAt = remoteData.updatedAt || 0;
+        
+        // If remote is newer or local is empty, use remote
+        if (remoteUpdatedAt > localUpdatedAt || !state.lists || Object.keys(state.lists).length === 0) {
+          state = remoteData;
+          saveData();
+          render();
+        }
+      } else {
+        // No remote data yet - push our local data
+        pushToFirebase();
+      }
+      setSyncStatus('synced');
+    }, (error) => {
+      console.warn('Firebase sync error:', error);
+      setSyncStatus('offline');
+    });
+  }
+
+  function pushToFirebase() {
+    if (!firebaseDb || !currentRoomId || !isOnline) return;
+    
+    isLocalChange = true;
+    state.updatedAt = Date.now();
+    
+    const roomRef = firebaseDb.ref('rooms/' + currentRoomId);
+    roomRef.set(state).then(() => {
+      setSyncStatus('synced');
+      setTimeout(() => { isLocalChange = false; }, 200);
+    }).catch((e) => {
+      console.warn('Push failed:', e);
+      setSyncStatus('offline');
+      isLocalChange = false;
+    });
+  }
+
+  function saveData() {
+    localStorage.setItem('familyTodoData', JSON.stringify(state));
+    // Also save room id
+    if (currentRoomId) {
+      localStorage.setItem('familyTodoRoom', currentRoomId);
+    }
+    // Sync to Firebase if online
+    if (isOnline && firebaseDb && currentRoomId) {
+      setSyncStatus('syncing');
+      // Debounce a bit
+      clearTimeout(saveData._debounce);
+      saveData._debounce = setTimeout(pushToFirebase, 300);
+    }
+  }
+
   function loadData() {
     try {
       const raw = localStorage.getItem('familyTodoData');
       if (raw) return JSON.parse(raw);
     } catch(e) {}
     return JSON.parse(JSON.stringify(DEFAULT_DATA));
-  }
-
-  function saveData() {
-    localStorage.setItem('familyTodoData', JSON.stringify(state));
   }
 
   function getCurrentList() {
@@ -1267,7 +1448,7 @@
       avatars.appendChild(div);
     });
     document.getElementById('bannerText').textContent =
-      `共享清单 · ${list.members.length} 位成员`;
+      isOnline ? `实时同步 · ${list.members.length} 位成员` : `共享清单 · ${list.members.length} 位成员`;
   }
 
   function renderStats() {
@@ -1477,6 +1658,11 @@
 
   // ============= Share / Import =============
   function generateShareLink() {
+    // If online and has room, share room link for real-time sync
+    if (isOnline && currentRoomId) {
+      return location.origin + location.pathname + '#room=' + currentRoomId;
+    }
+    // Fallback: legacy encoded data link
     const list = getCurrentList();
     const data = {
       v: 1,
@@ -1500,6 +1686,11 @@
     } catch(e) {
       return '';
     }
+  }
+
+  function getShareMode() {
+    if (isOnline && currentRoomId) return 'realtime';
+    return 'legacy';
   }
 
   function parseShareLink(hash) {
@@ -1700,6 +1891,16 @@
   function openShareModal() {
     const link = generateShareLink();
     document.getElementById('shareLinkBox').textContent = link;
+    
+    // Update share description based on mode
+    const isRealtime = getShareMode() === 'realtime';
+    const desc = document.getElementById('shareDesc');
+    if (desc) {
+      desc.textContent = isRealtime 
+        ? '家人打开链接加入后，所有人实时同步'
+        : '家人打开链接即可加入这个共享清单';
+    }
+    
     document.getElementById('shareModal').classList.add('show');
   }
 
@@ -1756,10 +1957,53 @@
 
   // ============= Import flow =============
   function checkImportOnLoad() {
+    // Check for room link first (realtime sharing)
+    const urlRoom = getRoomIdFromUrl();
+    if (urlRoom) {
+      showRoomJoinModal(urlRoom);
+      return;
+    }
+    // Fallback: legacy share link
     const data = parseShareLink(location.hash);
     if (data) {
       showImportModal(data);
     }
+  }
+
+  function showRoomJoinModal(roomId) {
+    const list = getCurrentList();
+    const todoCount = list.todos.length;
+    const memberCount = list.members.length;
+
+    const modal = document.getElementById('importModal');
+    document.getElementById('importListName').textContent = '加入共享清单';
+    document.getElementById('importSummary').textContent =
+      '加入后可实时同步所有任务和成员';
+    
+    // Replace buttons for room join
+    const confirmBtn = document.getElementById('importConfirmBtn');
+    const mergeBtn = document.getElementById('importMergeBtn');
+    
+    confirmBtn.textContent = '加入并同步';
+    mergeBtn.textContent = '仅查看（不加入）';
+
+    modal.classList.add('show');
+
+    confirmBtn.onclick = () => {
+      currentRoomId = roomId;
+      localStorage.setItem('familyTodoRoom', roomId);
+      if (firebaseDb && isOnline) {
+        subscribeToRoom(roomId);
+      }
+      closeImportModal();
+      showToast('已加入共享清单！');
+      history.replaceState(null, '', location.pathname + '#room=' + roomId);
+    };
+
+    mergeBtn.onclick = () => {
+      closeImportModal();
+      history.replaceState(null, '', location.pathname);
+    };
   }
 
   function showImportModal(data) {
@@ -1768,6 +2012,10 @@
     const memberCount = (data.members || []).length;
     document.getElementById('importSummary').textContent =
       `包含 ${todoCount} 个任务，${memberCount} 位成员`;
+    
+    // Reset buttons to legacy mode
+    document.getElementById('importConfirmBtn').textContent = '导入此清单';
+    document.getElementById('importMergeBtn').textContent = '合并到当前清单';
 
     document.getElementById('importModal').classList.add('show');
 
@@ -1997,6 +2245,17 @@
   function init() {
     bindEvents();
     render();
+    
+    // Set up room
+    ensureRoom();
+    
+    // Init Firebase
+    if (typeof firebase !== 'undefined') {
+      initFirebase();
+    } else {
+      setSyncStatus('offline');
+    }
+    
     checkImportOnLoad();
   }
 
