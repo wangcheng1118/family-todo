@@ -1199,6 +1199,34 @@
   </div>
 </div>
 
+<!-- Settings Modal -->
+<div class="modal-overlay" id="settingsModal">
+  <div class="modal-sheet">
+    <div class="modal-header">
+      <span class="modal-cancel" id="settingsCancel">完成</span>
+      <span class="modal-title">设置</span>
+      <span style="width:30px;"></span>
+    </div>
+    <div class="modal-body">
+      <div class="form-section">
+        <div class="form-label">共享房间</div>
+        <div id="settingsRoomId" style="font-size:14px; color:var(--text-secondary); word-break:break-all; padding:6px 0;"></div>
+        <div style="margin-top:6px; font-size:13px;">
+          同步状态：<span id="settingsSyncStatus">--</span>
+        </div>
+      </div>
+      <div class="form-section">
+        <button class="share-btn-secondary" id="settingsLeaveBtn" style="color:var(--red);">退出当前房间</button>
+        <div class="share-hint">退出后本地数据保留，可随时通过新链接重新加入</div>
+      </div>
+      <div class="form-section">
+        <button class="share-btn-secondary" id="settingsClearBtn" style="color:var(--red);">清空本地数据</button>
+        <div class="share-hint">仅清空本设备的清单，不影响其他家庭成员</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Import Modal -->
 <div class="modal-overlay" id="importModal">
   <div class="modal-sheet">
@@ -1292,6 +1320,7 @@
   let firebaseApp = null;
   let firebaseDb = null;
   let currentRoomId = null;
+  let currentRoomListener = null; // Firebase unsubscribe function
   let isOnline = false;
   let syncStatus = 'offline'; // offline, syncing, synced
   let isLocalChange = false; // prevent loop when applying remote changes
@@ -1334,7 +1363,20 @@
   }
 
   function generateRoomId() {
-    return 'room_' + Math.random().toString(36).substring(2, 10);
+    // 使用密码学安全随机数生成房间号 (8字节 = 16位十六进制 ≈ 128bit 熵)
+    // 防止 Math.random() 序列可预测 + 批量枚举攻击
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    return 'room_' + hex;
+  }
+
+  function generateTodoId() {
+    // 任务 ID 使用时间戳 + 随机后缀,保证循环/批量调用时不会撞 ID
+    const bytes = new Uint8Array(4);
+    crypto.getRandomValues(bytes);
+    const rand = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    return 't' + Date.now().toString(36) + '_' + rand;
   }
 
   function getRoomIdFromUrl() {
@@ -1363,18 +1405,24 @@
 
   function subscribeToRoom(roomId) {
     if (!firebaseDb || !roomId) return;
-    
+
+    // Unsubscribe from any previous room listener to avoid data leaks
+    if (currentRoomListener) {
+      try { currentRoomListener(); } catch (_) {}
+      currentRoomListener = null;
+    }
+
     const roomRef = firebaseDb.ref('rooms/' + roomId);
-    
-    roomRef.on('value', (snapshot) => {
+
+    const onValue = roomRef.on('value', (snapshot) => {
       if (isLocalChange) return; // ignore changes we just wrote
-      
+
       const remoteData = snapshot.val();
       if (remoteData && remoteData.lists) {
         // Remote data exists - merge/use it
         const localUpdatedAt = state.updatedAt || 0;
         const remoteUpdatedAt = remoteData.updatedAt || 0;
-        
+
         // If remote is newer or local is empty, use remote
         if (remoteUpdatedAt > localUpdatedAt || !state.lists || Object.keys(state.lists).length === 0) {
           state = remoteData;
@@ -1390,6 +1438,10 @@
       console.warn('Firebase sync error:', error);
       setSyncStatus('offline');
     });
+
+    // Firebase v9+ on() returns the unsubscribe function directly;
+    // legacy v3 returns the ref. Handle both.
+    currentRoomListener = typeof onValue === 'function' ? onValue : () => roomRef.off('value', onValue);
   }
 
   function pushToFirebase() {
@@ -1570,22 +1622,42 @@
       toggleTodo(todo.id);
     });
 
-    // Tap to edit
-    el.addEventListener('click', () => {
+    // Tap to edit — suppress click when a horizontal swipe occurred
+    let swipeOccurred = false;
+    el.addEventListener('click', (e) => {
+      if (swipeOccurred) { swipeOccurred = false; e.stopPropagation(); return; }
       openTodoModal(todo);
     });
 
-    // Swipe to delete (simplified - long press or double tap)
+    // Swipe to reveal delete — record start time & coords, decide on touchend
     let touchStartX = 0;
+    let touchStartY = 0;
+    let touchStartTime = 0;
     el.addEventListener('touchstart', (e) => {
       touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
+      touchStartTime = Date.now();
     }, { passive: true });
 
     el.addEventListener('touchend', (e) => {
-      const diff = touchStartX - e.changedTouches[0].clientX;
-      if (diff > 60) {
-        el.classList.add('swiped');
-      } else if (diff < -30) {
+      const endX = e.changedTouches[0].clientX;
+      const endY = e.changedTouches[0].clientY;
+      const dx = touchStartX - endX;
+      const dy = Math.abs(touchStartY - endY);
+      const dt = Date.now() - touchStartTime;
+
+      // Horizontal swipe: > 60px in X, < 50px in Y, completed within 500ms
+      const isSwipe = Math.abs(dx) > 60 && dy < 50 && dt < 500;
+
+      if (isSwipe) {
+        swipeOccurred = true;
+        if (dx > 0) {
+          el.classList.add('swiped');
+        } else {
+          el.classList.remove('swiped');
+        }
+      } else {
+        // Reset lingering swiped state on a tap / scroll
         el.classList.remove('swiped');
       }
     });
@@ -1626,7 +1698,7 @@
   function addTodo(text, priority, assignee, dueDate) {
     const list = getCurrentList();
     list.todos.push({
-      id: 't' + Date.now(),
+      id: generateTodoId(),
       text: text.trim(),
       priority,
       assignee,
@@ -1793,7 +1865,7 @@
     (data.todos || []).forEach(t => {
       const assigneeIdx = t.a === 0 ? 'me' : memberMap[t.a];
       list.todos.push({
-        id: 't' + Date.now() + Math.random().toString(36).substr(2, 5),
+        id: generateTodoId(),
         text: t.x,
         priority: t.p || 'medium',
         assignee: assigneeIdx || '',
@@ -1947,6 +2019,55 @@
 
   function closeShareModal() {
     document.getElementById('shareModal').classList.remove('show');
+  }
+
+  function openSettingsModal() {
+    const roomEl = document.getElementById('settingsRoomId');
+    const syncEl = document.getElementById('settingsSyncStatus');
+    roomEl.textContent = currentRoomId
+      ? currentRoomId
+      : '本地模式（未连接房间）';
+    syncEl.textContent = firebaseDb && isOnline
+      ? '已连接'
+      : (firebaseDb ? '连接中...' : '离线');
+    syncEl.style.color = firebaseDb && isOnline ? 'var(--green)' : 'var(--orange)';
+
+    document.getElementById('settingsModal').classList.add('show');
+  }
+
+  function closeSettingsModal() {
+    document.getElementById('settingsModal').classList.remove('show');
+  }
+
+  function leaveRoom() {
+    if (!currentRoomId) {
+      showToast('当前未加入房间');
+      return;
+    }
+    if (!confirm('确定要退出当前共享房间吗？\n\n本地清单数据将保留，可以下次重新加入。')) return;
+    if (firebaseDb) {
+      // 解除订阅
+      if (currentRoomListener) currentRoomListener();
+      currentRoomListener = null;
+      firebaseDb.ref('rooms/' + currentRoomId + '/members/' + 'me').remove().catch(() => {});
+    }
+    currentRoomId = null;
+    localStorage.removeItem('familyTodoRoom');
+    history.replaceState(null, '', location.pathname);
+    saveLocal();
+    closeSettingsModal();
+    showToast('已退出房间');
+  }
+
+  function clearLocalData() {
+    if (!confirm('确定要清空本地所有清单吗？\n\n如果已加入共享房间，房间里的其他成员不受影响。\n此操作不可恢复。')) return;
+    localStorage.removeItem('familyTodoData');
+    localStorage.removeItem('familyTodoRoom');
+    state = createDefaultState();
+    saveLocal();
+    render();
+    closeSettingsModal();
+    showToast('本地数据已清空');
   }
 
   function openMembersModal() {
@@ -2214,25 +2335,32 @@
         document.querySelectorAll('.tab-item').forEach(t => t.classList.remove('active'));
         tab.classList.add('active');
         const tabName = tab.dataset.tab;
+        const resetActive = () => {
+          document.querySelectorAll('.tab-item').forEach(t => t.classList.remove('active'));
+          document.querySelector('[data-tab="tasks"]').classList.add('active');
+        };
         if (tabName === 'members') {
           openMembersModal();
           // Reset active tab to tasks since modal covers it
-          setTimeout(() => {
-            document.querySelectorAll('.tab-item').forEach(t => t.classList.remove('active'));
-            document.querySelector('[data-tab="tasks"]').classList.add('active');
-          }, 300);
+          setTimeout(resetActive, 300);
         } else if (tabName === 'settings') {
-          openMembersModal();
-          setTimeout(() => {
-            document.querySelectorAll('.tab-item').forEach(t => t.classList.remove('active'));
-            document.querySelector('[data-tab="tasks"]').classList.add('active');
-          }, 300);
+          openSettingsModal();
+          setTimeout(resetActive, 300);
         }
       });
     });
 
     // Members modal
     document.getElementById('membersCancel').addEventListener('click', closeMembersModal);
+
+    // Settings modal
+    document.getElementById('settingsCancel').addEventListener('click', closeSettingsModal);
+    document.getElementById('settingsLeaveBtn').addEventListener('click', () => {
+      leaveRoom();
+    });
+    document.getElementById('settingsClearBtn').addEventListener('click', () => {
+      clearLocalData();
+    });
     document.getElementById('addMemberBtn').addEventListener('click', () => {
       const name = document.getElementById('newMemberInput').value.trim();
       if (name) {

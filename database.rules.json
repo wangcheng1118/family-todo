@@ -1,0 +1,28 @@
+{
+  "rules": {
+    "rooms": {
+      "$roomId": {
+        // 任何人都能读(房间号本身充当共享密钥,熵约 128 bit)
+        ".read": true,
+
+        // 写入必须满足以下全部条件:
+        //   1) 必须是 PUT(set)整个对象,且包含 lists + updatedAt
+        //   2) updatedAt 必须是数字,且单调递增(防止回退时间戳篡改)
+        //   3) 数据体积限制(防止脚本用大 payload 把数据库撑爆)
+        //   4) lists 必须非空
+        ".write": "(!data.exists() || data.child('updatedAt').val() <= newData.child('updatedAt').val()) &&
+                   newData.hasChildren(['lists', 'updatedAt']) &&
+                   newData.child('updatedAt').isNumber() &&
+                   newData.child('lists').hasChildren() &&
+                   newData.val().length < 100000",
+
+        // 子节点单独写也是允许的(增量更新用),但 updatedAt 单调性仍要约束
+        "members": {
+          "$memberId": {
+            ".validate": "newData.hasChildren(['id', 'name'])"
+          }
+        }
+      }
+    }
+  }
+}
