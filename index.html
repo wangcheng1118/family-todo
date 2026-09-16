@@ -2277,8 +2277,18 @@
 
   // ============= PWA =============
   if ('serviceWorker' in navigator) {
+    let refreshing = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (refreshing) return;
+      refreshing = true;
+      window.location.reload();
+    });
+
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('service-worker.js').catch(() => {});
+      navigator.serviceWorker.register('service-worker.js').then((reg) => {
+        // 定期检查更新（每 60 分钟）
+        setInterval(() => reg.update(), 60 * 60 * 1000);
+      }).catch(() => {});
     });
   }
 
