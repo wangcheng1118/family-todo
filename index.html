@@ -972,7 +972,57 @@
   .toast.show {
     opacity: 1;
     transform: translateX(-50%) translateY(0);
+    pointer-events: auto;
   }
+  .toast-action {
+    margin-left: 14px;
+    padding: 5px 14px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.2);
+    color: #fff;
+    font-weight: 700;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .toast-action:active { background: rgba(255,255,255,0.35); }
+
+  /* iOS 添加到主屏引导横幅 */
+  .a2hs-banner {
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 12px);
+    background: var(--surface-elevated);
+    border-radius: 16px;
+    padding: 14px;
+    display: none;
+    align-items: center;
+    gap: 12px;
+    z-index: 400;
+    box-shadow: var(--shadow-lg);
+    border: 0.5px solid var(--separator);
+  }
+  .a2hs-banner.show { display: flex; animation: a2hsIn 0.45s cubic-bezier(0.25,0.1,0.25,1.2); }
+  @keyframes a2hsIn { from { transform: translateY(24px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  .a2hs-close {
+    flex-shrink: 0;
+    cursor: pointer;
+    padding: 6px;
+    color: var(--text-secondary);
+    font-size: 14px;
+  }
+
+  /* 周报入口卡片（占满整行） */
+  .stat-card.weekly-card {
+    grid-column: span 3;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+  }
+  .stat-card.weekly-card:active { opacity: 0.75; }
+  .weekly-emoji { font-size: 24px; margin-right: 4px; }
 
   /* Animations */
   @keyframes slideIn {
@@ -1050,6 +1100,16 @@
     <div class="stat-card">
       <div class="stat-number stat-green" id="statDone">0</div>
       <div class="stat-label">已完成</div>
+    </div>
+    <div class="stat-card weekly-card" id="weeklyStatCard">
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span class="weekly-emoji">🏆</span>
+        <div>
+          <div style="font-size:15px; font-weight:700;">本周完成 <span id="statWeekly" style="color:var(--green);">0</span> 项</div>
+          <div style="font-size:12px; color:var(--text-secondary); margin-top:2px;">点击查看家庭周报与成就</div>
+        </div>
+      </div>
+      <span style="color:var(--text-secondary); font-size:18px;">›</span>
     </div>
   </div>
 
@@ -1264,6 +1324,39 @@
 
 <!-- Toast -->
 <div class="toast" id="toast"></div>
+
+<!-- iOS 添加到主屏引导横幅 -->
+<div class="a2hs-banner" id="a2hsBanner">
+  <div style="font-size:28px; flex-shrink:0;">📲</div>
+  <div style="flex:1; min-width:0;">
+    <div style="font-weight:700; font-size:14px;">把家庭清单装进主屏幕</div>
+    <div style="font-size:12px; color:var(--text-secondary); margin-top:3px; line-height:1.5;">点 Safari 底部 <b>分享</b> 按钮，选择「添加到主屏幕」，即可像 App 一样全屏使用</div>
+  </div>
+  <span class="a2hs-close" id="a2hsClose">✕</span>
+</div>
+
+<!-- Weekly Report Modal -->
+<div class="modal-overlay" id="weeklyModal">
+  <div class="modal-sheet">
+    <div class="modal-header">
+      <span class="modal-cancel" id="weeklyCancel">关闭</span>
+      <span class="modal-title">🏆 家庭周报</span>
+      <span style="width:30px;"></span>
+    </div>
+    <div class="modal-body">
+      <div class="form-section">
+        <div class="form-label">本周战况</div>
+        <div id="weeklySummary" style="font-size:14px; color:var(--text-secondary); line-height:1.6;"></div>
+        <div id="weeklyLeaderboard" style="margin-top:10px;"></div>
+      </div>
+      <div class="form-section">
+        <div class="form-label">家庭成就</div>
+        <div id="achievementsGrid" style="display:grid; grid-template-columns:repeat(3, 1fr); gap:10px;"></div>
+        <div class="share-hint">灰色为未解锁成就，和家人一起完成更多任务来点亮吧</div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script>
 (function() {
@@ -1794,6 +1887,95 @@
     document.getElementById('statTotal').textContent = total;
     document.getElementById('statDone').textContent = done;
     document.getElementById('statPending').textContent = pending;
+    document.getElementById('statWeekly').textContent = countWeeklyDone(list);
+  }
+
+  // 本周一 00:00 起完成的任务数
+  function getWeekStartTs(now) {
+    const d = new Date(now);
+    const day = (d.getDay() + 6) % 7; // 周一=0
+    d.setDate(d.getDate() - day);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  function countWeeklyDone(list) {
+    const weekStart = getWeekStartTs(new Date());
+    return (list.todos || []).filter(t => t.done && t.completedAt && t.completedAt >= weekStart).length;
+  }
+
+  // ============ 家庭周报 / 成就卡片 ============
+  function openWeeklyModal() {
+    renderWeeklyModal();
+    document.getElementById('weeklyModal').classList.add('show');
+  }
+  function closeWeeklyModal() {
+    document.getElementById('weeklyModal').classList.remove('show');
+  }
+
+  function renderWeeklyModal() {
+    const list = getCurrentList();
+    const weekStart = getWeekStartTs(new Date());
+    const weekly = (list.todos || []).filter(t => t.done && t.completedAt && t.completedAt >= weekStart);
+
+    // 本周战况摘要
+    const summary = weekly.length === 0
+      ? '本周还没有完成任务，从一件小事开始吧 💪'
+      : `全家人本周一共完成了 ${weekly.length} 项任务${weekly.length >= 10 ? '，太厉害了 🎉' : '，继续保持！'}`;
+    document.getElementById('weeklySummary').textContent = summary;
+
+    // 成员榜
+    const board = document.getElementById('weeklyLeaderboard');
+    board.innerHTML = '';
+    const counts = {};
+    weekly.forEach(t => {
+      const k = t.completedBy || 'unknown';
+      counts[k] = (counts[k] || 0) + 1;
+    });
+    const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    if (entries.length === 0) {
+      board.innerHTML = '<div style="font-size:13px; color:var(--text-secondary);">暂无完成记录，点击任务左侧圆圈即可打卡</div>';
+    } else {
+      entries.forEach(([mid, n], i) => {
+        const m = getMemberById(mid) || { name: '神秘成员', color: 'gray' };
+        const medal = ['🥇', '🥈', '🥉'][i] || '·';
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex; align-items:center; gap:10px; padding:8px 0;';
+        row.innerHTML = `
+          <span style="font-size:16px; width:24px; text-align:center;">${medal}</span>
+          <div style="width:32px; height:32px; border-radius:50%; background:${COLOR_MAP[m.color] || COLOR_MAP.gray}; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:600; font-size:13px;">${escapeHtml(m.name.charAt(0))}</div>
+          <div style="flex:1; font-size:15px;">${escapeHtml(m.name)}</div>
+          <div style="font-weight:700; color:var(--green);">${n} 项</div>`;
+        board.appendChild(row);
+      });
+    }
+
+    // 成就（跨所有清单统计）
+    let totalDone = 0;
+    Object.values(state.lists).forEach(l => {
+      (l.todos || []).forEach(t => { if (t && t.done) totalDone++; });
+    });
+    const memberCount = list.members.length;
+    const listCount = Object.keys(state.lists).length;
+    const achievements = [
+      { emoji: '🌱', label: '初次开工', desc: '完成第 1 项任务', unlocked: totalDone >= 1 },
+      { emoji: '🔥', label: '小有所成', desc: '累计完成 10 项', unlocked: totalDone >= 10 },
+      { emoji: '💪', label: '家庭主力', desc: '累计完成 50 项', unlocked: totalDone >= 50 },
+      { emoji: '🏆', label: '效率之王', desc: '累计完成 100 项', unlocked: totalDone >= 100 },
+      { emoji: '👨‍👩‍👧', label: '全家总动员', desc: `${memberCount} 位成员`, unlocked: memberCount >= 3 },
+      { emoji: '📚', label: '清单达人', desc: `管理 ${listCount} 个清单`, unlocked: listCount >= 2 }
+    ];
+    const grid = document.getElementById('achievementsGrid');
+    grid.innerHTML = '';
+    achievements.forEach(a => {
+      const cell = document.createElement('div');
+      cell.style.cssText = 'text-align:center; padding:14px 6px; border-radius:14px; background:var(--surface-elevated);' +
+        (a.unlocked ? '' : 'opacity:0.35; filter:grayscale(1);');
+      cell.innerHTML = `
+        <div style="font-size:26px;">${a.emoji}</div>
+        <div style="font-size:13px; font-weight:700; margin-top:6px;">${a.label}</div>
+        <div style="font-size:11px; color:var(--text-secondary); margin-top:2px;">${a.desc}</div>`;
+      grid.appendChild(cell);
+    });
   }
 
   function renderTodos() {
@@ -1839,6 +2021,7 @@
     el.dataset.id = todo.id;
 
     const member = getMemberById(todo.assignee);
+    const completer = (todo.done && todo.completedBy) ? getMemberById(todo.completedBy) : null;
     const dueDateText = todo.dueDate ? formatDate(todo.dueDate) : '';
     const isOverdue = todo.dueDate && !todo.done && new Date(todo.dueDate) < new Date(new Date().toDateString());
 
@@ -1850,6 +2033,7 @@
           <span class="priority-indicator priority-${todo.priority}"></span>
           ${member ? `<span class="assignee-pill" style="background: ${COLOR_MAP[member.color]}15; color: ${COLOR_MAP[member.color]};"><span style="width:6px;height:6px;border-radius:50%;background:${COLOR_MAP[member.color]};display:inline-block;"></span>${escapeHtml(member.name)}</span>` : ''}
           ${dueDateText ? `<span class="due-date ${isOverdue ? 'overdue' : ''}">📅 ${dueDateText}</span>` : ''}
+          ${completer ? `<span class="assignee-pill" style="background:${COLOR_MAP[completer.color] || COLOR_MAP.gray}15; color:${COLOR_MAP[completer.color] || COLOR_MAP.gray};">✓ ${escapeHtml(completer.name)} 完成</span>` : ''}
         </div>
       </div>
       <div class="swipe-actions">
@@ -1919,11 +2103,34 @@
   }
 
   // ============= Actions =============
+  // 完成时刻的人情味文案，{name} 会被替换为完成人昵称
+  const PRAISE_TEMPLATES = [
+    '干得漂亮，{name}！🎉',
+    '{name}又完成一项，太棒了！',
+    '为 {name} 点赞 👏',
+    '{name}，效率满满！',
+    '搞定！{name} 真靠谱 💪',
+    '这项被 {name} 拿下啦！',
+    '家庭小能手 {name} 上线 ✨'
+  ];
+
   function toggleTodo(id) {
     const list = getCurrentList();
     const todo = list.todos.find(t => t.id === id);
     if (todo) {
-      todo.done = !todo.done;
+      if (todo.done) {
+        // 取消完成：清掉完成记录，撤销后重新完成会重新记录
+        todo.done = false;
+        todo.completedAt = null;
+        todo.completedBy = null;
+      } else {
+        todo.done = true;
+        todo.completedAt = Date.now();
+        todo.completedBy = getCurrentMemberId();
+        const me = getMemberById(todo.completedBy) || { name: '我' };
+        const tpl = PRAISE_TEMPLATES[Math.floor(Math.random() * PRAISE_TEMPLATES.length)];
+        showToast(tpl.replace('{name}', me.name), null, 2200);
+      }
       saveData();
       render();
     }
@@ -1931,10 +2138,25 @@
 
   function deleteTodo(id) {
     const list = getCurrentList();
-    list.todos = list.todos.filter(t => t.id !== id);
+    const idx = list.todos.findIndex(t => t.id === id);
+    if (idx < 0) return;
+    const removed = list.todos[idx];
+    const removedFromListId = list.id || state.currentListId;
+    list.todos.splice(idx, 1);
     saveData();
     render();
-    showToast('已删除');
+    const brief = removed.text.length > 12 ? removed.text.slice(0, 12) + '…' : removed.text;
+    showToast(`已删除「${brief}」`, {
+      label: '撤销',
+      fn: () => {
+        const target = state.lists[removedFromListId] || getCurrentList();
+        if (target.todos.some(t => t.id === removed.id)) return; // 已恢复过
+        target.todos.splice(Math.min(idx, target.todos.length), 0, removed);
+        saveData();
+        render();
+        showToast('已恢复该任务');
+      }
+    }, 5000);
   }
 
   function addTodo(text, priority, assignee, dueDate) {
@@ -2525,12 +2747,27 @@
 
   // ============= Toast =============
   let toastTimer = null;
-  function showToast(msg) {
+  function showToast(msg, action, duration) {
     const toast = document.getElementById('toast');
-    toast.textContent = msg;
+    toast.innerHTML = '';
+    const span = document.createElement('span');
+    span.textContent = msg;
+    toast.appendChild(span);
+    // 可选操作按钮（如"撤销"）
+    if (action && action.label && typeof action.fn === 'function') {
+      const btn = document.createElement('span');
+      btn.className = 'toast-action';
+      btn.textContent = action.label;
+      btn.addEventListener('click', () => {
+        clearTimeout(toastTimer);
+        toast.classList.remove('show');
+        try { action.fn(); } catch (e) { console.warn(e); }
+      });
+      toast.appendChild(btn);
+    }
     toast.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toast.classList.remove('show'), 2000);
+    toastTimer = setTimeout(() => toast.classList.remove('show'), duration || (action ? 5000 : 2000));
   }
 
   // ============= Helpers =============
@@ -2809,6 +3046,31 @@
 
       // 初始调度提醒（render() 已经触发过一次，这里再保险一次，确保首次启动生效）
       try { scheduleReminders(); } catch (_) {}
+
+      // 家庭周报入口
+      document.getElementById('weeklyStatCard').addEventListener('click', openWeeklyModal);
+      document.getElementById('weeklyCancel').addEventListener('click', closeWeeklyModal);
+      document.getElementById('weeklyModal').addEventListener('click', (e) => {
+        if (e.target === e.currentTarget) closeWeeklyModal();
+      });
+
+      // iOS 添加到主屏引导：仅在 iOS Safari 浏览器内访问、未添加到主屏、且用户未关闭过时展示
+      try {
+        const ua = navigator.userAgent;
+        const isIOS = /iPhone|iPad|iPod/.test(ua) ||
+          (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS 13+ 桌面 UA
+        const isStandalone = window.navigator.standalone === true ||
+          window.matchMedia('(display-mode: standalone)').matches;
+        let a2hsDismissed = false;
+        try { a2hsDismissed = localStorage.getItem('familyTodoA2HSDismissed') === '1'; } catch (_) {}
+        if (isIOS && !isStandalone && !a2hsDismissed) {
+          document.getElementById('a2hsBanner').classList.add('show');
+        }
+        document.getElementById('a2hsClose').addEventListener('click', () => {
+          document.getElementById('a2hsBanner').classList.remove('show');
+          setLocal('familyTodoA2HSDismissed', '1');
+        });
+      } catch (_) {}
     } catch(e) {
       console.error('Init error:', e);
       // Fallback: try to at least render something
