@@ -1220,6 +1220,16 @@
         <div class="share-hint">退出后本地数据保留，可随时通过新链接重新加入</div>
       </div>
       <div class="form-section">
+        <div style="display:flex; align-items:center; justify-content:space-between; padding:6px 0;">
+          <span style="font-size:16px;">截止日提醒</span>
+          <label style="position:relative; display:inline-block; width:48px; height:28px;">
+            <input type="checkbox" id="settingsNotifyToggle" style="opacity:0; width:0; height:0;">
+            <span id="settingsNotifyToggleSlider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background:#ccc; border-radius:14px; transition:.3s;"></span>
+          </label>
+        </div>
+        <div class="share-hint" id="settingsNotifyHint">到期日早 9:00 发送系统通知。浏览器关闭后可能失效，建议同时打开 Push 推送。</div>
+      </div>
+      <div class="form-section">
         <button class="share-btn-secondary" id="settingsClearBtn" style="color:var(--red);">清空本地数据</button>
         <div class="share-hint">仅清空本设备的清单，不影响其他家庭成员</div>
       </div>
@@ -1379,6 +1389,56 @@
     return 't' + Date.now().toString(36) + '_' + rand;
   }
 
+  // 当前浏览器实例的稳定身份 ID。每台设备/浏览器唯一, 用于在共享清单中正确
+  // 区分"我", 避免多人加入同一房间时把所有本机成员都识别为同一个 'me' 而互相覆盖。
+  // 通过 localStorage 持久化, 卸载 PWA 不会丢失。
+  let _currentMemberId = null;
+  function getCurrentMemberId() {
+    if (_currentMemberId) return _currentMemberId;
+    const cached = (function () {
+      try { return localStorage.getItem('familyTodoClient'); } catch (e) { return null; }
+    })();
+    if (cached) {
+      _currentMemberId = cached;
+      return cached;
+    }
+    // 本机首次访问：生成稳定的 clientId（128bit，与 generateRoomId 同源熵）
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    const id = 'u_' + hex;
+    try { localStorage.setItem('familyTodoClient', id); } catch (e) {}
+    _currentMemberId = id;
+    return id;
+  }
+
+  // 数据迁移：将旧数据结构里硬编码的 'me' 全部替换为当前 clientId。
+  // 仅在 loadData 后执行一次 (in-memory); 不需要重写 localStorage, 第一次写入自然就存的是 clientId。
+  function migrateLegacyMe() {
+    const myId = getCurrentMemberId();
+    let changed = false;
+    Object.values(state.lists).forEach(list => {
+      if (!list || !Array.isArray(list.members)) return;
+      // 把所有成员 id = 'me' 替换为 clientId
+      list.members.forEach(m => {
+        if (m && m.id === 'me') {
+          m.id = myId;
+          changed = true;
+        }
+      });
+      // 任务 assignee 同步迁移
+      if (Array.isArray(list.todos)) {
+        list.todos.forEach(t => {
+          if (t && t.assignee === 'me') {
+            t.assignee = myId;
+            changed = true;
+          }
+        });
+      }
+    });
+    return changed;
+  }
+
   function getRoomIdFromUrl() {
     const hash = location.hash;
     const match = hash.match(/#room=([a-zA-Z0-9_-]+)/);
@@ -1396,7 +1456,7 @@
     }
     // Generate new room
     currentRoomId = generateRoomId();
-    localStorage.setItem('familyTodoRoom', currentRoomId);
+    setLocal('familyTodoRoom', currentRoomId);
   }
 
   function subscribeToRoom(roomId) {
@@ -1422,6 +1482,7 @@
         // If remote is newer or local is empty, use remote
         if (remoteUpdatedAt > localUpdatedAt || !state.lists || Object.keys(state.lists).length === 0) {
           state = normalizeState(remoteData);
+          migrateLegacyMe();
           saveLocal();
           render();
         }
@@ -1458,10 +1519,10 @@
   }
 
   function saveData() {
-    localStorage.setItem('familyTodoData', JSON.stringify(state));
+    setLocal('familyTodoData', JSON.stringify(state));
     // Also save room id
     if (currentRoomId) {
-      localStorage.setItem('familyTodoRoom', currentRoomId);
+      setLocal('familyTodoRoom', currentRoomId);
     }
     // Sync to Firebase if online
     if (isOnline && firebaseDb && currentRoomId) {
@@ -1479,7 +1540,23 @@
   // 仅保存到本设备（localStorage），不推送 Firebase。
   // 用于"退出房间 / 接收远端数据 / 清空本地数据"等不应回写云端的场景。
   function saveLocal() {
-    localStorage.setItem('familyTodoData', JSON.stringify(state));
+    setLocal('familyTodoData', JSON.stringify(state));
+  }
+
+  // localStorage 写入统一入口：捕获取容量超限、Safari 隐私模式等异常，
+  // 避免一次写入失败就让整个 saveData/saveLocal 抛错导致数据丢失。
+  function setLocal(key, value) {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch (e) {
+      console.warn('[family-todo] localStorage 写入失败：', key, e);
+      if (!setLocal._warned) {
+        setLocal._warned = true;
+        try { showToast('⚠️ 本地存储不可用，数据仅在当前会话保留'); } catch (_) {}
+      }
+      return false;
+    }
   }
 
   // 校验并补全数据结构：防止损坏的 localStorage 或畸形远端数据
@@ -1493,7 +1570,7 @@
       if (typeof list.name !== 'string' || !list.name) list.name = '清单';
       if (!Array.isArray(list.todos)) list.todos = [];
       if (!Array.isArray(list.members) || list.members.length === 0) {
-        list.members = [{ id: 'me', name: '我', color: 'blue' }];
+        list.members = [{ id: getCurrentMemberId(), name: '我', color: 'blue' }];
       }
     });
     if (Object.keys(raw.lists).length === 0 || !raw.lists[raw.currentListId]) {
@@ -1529,6 +1606,142 @@
     renderBanner();
     renderStats();
     renderTodos();
+    // 任何 state 变化都重新调度提醒, 保证新增/删除/改 dueDate 立即生效
+    scheduleReminders();
+  }
+
+  // ============ 截止日提醒（本地通知）============
+  // 调度策略:
+  //   - 每个有 dueDate 且未完成的任务, 计算其到期日的当天 09:00 (本地时区) 触发
+  //   - 已过期 (<= 今天 09:00) 立即触发一次, 之后不再重复
+  //   - 已提醒过的任务写入 localStorage('familyTodoNotified') 去重, 避免同一任务重复通知
+  //   - 浏览器关闭后 SW 会被休眠, 真正的"后台提醒"需要 Push API + 服务端, 此处只能保证
+  //     应用在前台/后台(浏览器未完全退出)时可靠触发, 已在 UI 上注明这一限制
+  const REMINDER_HOUR = 9;
+  const NOTIFIED_KEY = 'familyTodoNotified';
+  const NOTIFY_ENABLED_KEY = 'familyTodoNotifyEnabled';
+
+  function getNotifyEnabled() {
+    try {
+      const v = localStorage.getItem(NOTIFY_ENABLED_KEY);
+      // 默认开启 (未设置过视为开启)，首次 scheduleReminders 时再请求权限
+      return v === null ? true : v === '1';
+    } catch (e) { return true; }
+  }
+  function setNotifyEnabled(enabled) {
+    setLocal(NOTIFY_ENABLED_KEY, enabled ? '1' : '0');
+  }
+
+  function getNotifiedMap() {
+    try {
+      const raw = localStorage.getItem(NOTIFIED_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (e) { return {}; }
+  }
+  function setNotifiedMap(map) {
+    setLocal(NOTIFIED_KEY, JSON.stringify(map));
+  }
+  function markNotified(todoId, dueDate) {
+    const map = getNotifiedMap();
+    map[todoId] = dueDate;
+    setNotifiedMap(map);
+  }
+  function wasNotified(todoId, dueDate) {
+    const map = getNotifiedMap();
+    return map[todoId] === dueDate;
+  }
+
+  function requestNotifyPermission() {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'default') {
+      try { Notification.requestPermission().catch(() => {}); } catch (e) {}
+    }
+  }
+
+  function fireNotification(todo) {
+    if (!('Notification' in window)) return;
+    if (Notification.permission !== 'granted') return;
+    if (document.visibilityState === 'visible') return; // 页面已可见, 让 toast 承担
+    try {
+      const n = new Notification('清单提醒：' + (todo.text || '待办'), {
+        body: '截止日：' + formatDate(todo.dueDate),
+        tag: 'todo-' + todo.id,
+        renotify: true,
+        requireInteraction: false
+      });
+      n.onclick = () => { try { window.focus(); } catch (_) {} n.close(); };
+    } catch (e) {
+      console.warn('[family-todo] 通知失败:', e);
+    }
+  }
+
+  function scheduleReminders() {
+    if (!state || !state.lists) return;
+    if (!('Notification' in window)) return; // 不支持则直接放弃, 不影响其他功能
+    if (!getNotifyEnabled()) return; // 用户关闭
+    requestNotifyPermission();
+
+    const now = new Date();
+    const todos = [];
+    Object.values(state.lists).forEach(list => {
+      if (!Array.isArray(list.todos)) return;
+      list.todos.forEach(t => {
+        if (!t || t.done || !t.dueDate) return;
+        todos.push(t);
+      });
+    });
+
+    todos.forEach(todo => {
+      const due = new Date(todo.dueDate + 'T00:00:00');
+      if (isNaN(due.getTime())) return;
+      const fireAt = new Date(due);
+      fireAt.setHours(REMINDER_HOUR, 0, 0, 0);
+      const delay = fireAt.getTime() - now.getTime();
+
+      // 已过期 (今天 09:00 之前) 且未通知过 -> 立即补提醒一次
+      if (delay <= 0) {
+        if (!wasNotified(todo.id, todo.dueDate)) {
+          fireNotification(todo);
+          markNotified(todo.id, todo.dueDate);
+        }
+        return;
+      }
+
+      // 改 dueDate 后回退或到期日已过, 但之前标记为已通知, 重置标记
+      if (wasNotified(todo.id, todo.dueDate)) return;
+
+      // 暂存定时器 id 以便取消 (本次实现不维护 timer pool, 因为单次 setTimeout
+      // 在窗口关闭后会被回收, 简单实现更不易出错)
+      try {
+        setTimeout(() => {
+          if (!state || !state.lists) return;
+          // 再次校验任务是否仍存在、是否未完成
+          let stillExists = false;
+          Object.values(state.lists).forEach(list => {
+            if (!Array.isArray(list.todos)) return;
+            list.todos.forEach(t => {
+              if (t && t.id === todo.id && !t.done && t.dueDate === todo.dueDate) stillExists = true;
+            });
+          });
+          if (!stillExists) return;
+          fireNotification(todo);
+          markNotified(todo.id, todo.dueDate);
+        }, Math.min(delay, 0x7fffffff));
+      } catch (e) {}
+    });
+
+    // 清理已被删除的任务标记, 避免 notified map 无限增长
+    try {
+      const map = getNotifiedMap();
+      const liveIds = new Set(todos.map(t => t.id));
+      let cleaned = false;
+      Object.keys(map).forEach(id => {
+        if (!liveIds.has(id)) { delete map[id]; cleaned = true; }
+      });
+      if (cleaned) setNotifiedMap(map);
+    } catch (e) {}
   }
 
   function renderListTitle() {
@@ -1760,7 +1973,7 @@
       color,
       icon,
       members: [
-        { id: 'me', name: getMyName(), color: 'blue' }
+        { id: getCurrentMemberId(), name: getMyName(), color: 'blue' }
       ],
       todos: []
     };
@@ -1771,7 +1984,7 @@
 
   function getMyName() {
     const list = getCurrentList();
-    const me = list.members.find(m => m.id === 'me');
+    const me = list.members.find(m => m.id === getCurrentMemberId());
     return me ? me.name : '我';
   }
 
@@ -1790,8 +2003,9 @@
   }
 
   function updateMyName(name) {
+    const myId = getCurrentMemberId();
     Object.values(state.lists).forEach(list => {
-      const me = list.members.find(m => m.id === 'me');
+      const me = list.members.find(m => m.id === myId);
       if (me) me.name = name.trim() || '我';
     });
     saveData();
@@ -1815,7 +2029,7 @@
       todos: list.todos.map(t => ({
         x: t.text,
         p: t.priority,
-        a: t.assignee === 'me' ? 0 : list.members.findIndex(m => m.id === t.assignee),
+        a: t.assignee === getCurrentMemberId() ? 0 : list.members.findIndex(m => m.id === t.assignee),
         d: t.dueDate || '',
         f: t.done ? 1 : 0
       }))
@@ -1864,19 +2078,20 @@
     }
 
     const list = state.lists[listId];
+    const myId = getCurrentMemberId();
 
-    // Map members - "me" always maps to local me
-    memberMap['me'] = 'me';
+    // Map members - "me" always maps to local me (现在 me == clientId)
+    memberMap['me'] = myId;
 
-    // Ensure 'me' exists
-    if (!list.members.find(m => m.id === 'me')) {
-      list.members.unshift({ id: 'me', name: '我', color: 'blue' });
+    // Ensure 本机成员已 exists
+    if (!list.members.find(m => m.id === myId)) {
+      list.members.unshift({ id: myId, name: '我', color: 'blue' });
     }
 
     // Add other members from share
     (data.members || []).forEach((m, idx) => {
       if (idx === 0) {
-        // First member is the sharer - map to 'me' for them but we keep our 'me'
+        // First member is the sharer - map to 本机 for them but we keep our clientId
         // Skip or rename
         return;
       }
@@ -1892,7 +2107,7 @@
 
     // Import todos
     (data.todos || []).forEach(t => {
-      const assigneeIdx = t.a === 0 ? 'me' : memberMap[t.a];
+      const assigneeIdx = t.a === 0 ? myId : memberMap[t.a];
       list.todos.push({
         id: generateTodoId(),
         text: t.x,
@@ -1968,7 +2183,7 @@
       const chip = document.createElement('div');
       chip.className = 'member-chip' + (selectedAssignee === m.id ? ' active' : '');
       chip.innerHTML = `
-        <div class="chip-avatar" style="background:${COLOR_MAP[m.color] || COLOR_MAP.gray};">${m.name.charAt(0)}</div>
+        <div class="chip-avatar" style="background:${COLOR_MAP[m.color] || COLOR_MAP.gray};">${escapeHtml(m.name.charAt(0))}</div>
         <span>${escapeHtml(m.name)}</span>
       `;
       chip.addEventListener('click', () => {
@@ -2061,6 +2276,25 @@
       : (firebaseDb ? '连接中...' : '离线');
     syncEl.style.color = firebaseDb && isOnline ? 'var(--green)' : 'var(--orange)';
 
+    // 通知开关
+    const tog = document.getElementById('settingsNotifyToggle');
+    const slider = document.getElementById('settingsNotifyToggleSlider');
+    const enabled = getNotifyEnabled();
+    tog.checked = enabled;
+    slider.style.background = enabled ? 'var(--green)' : '#ccc';
+    const support = 'Notification' in window;
+    if (!support) {
+      tog.disabled = true;
+      slider.style.opacity = '0.4';
+      document.getElementById('settingsNotifyHint').textContent = '当前浏览器不支持通知功能';
+    } else if (Notification.permission === 'denied') {
+      document.getElementById('settingsNotifyHint').textContent = '系统通知已被浏览器禁用，请在浏览器设置中开启';
+    } else if (Notification.permission === 'granted') {
+      document.getElementById('settingsNotifyHint').textContent = '到期日早 9:00 发送系统通知';
+    } else {
+      document.getElementById('settingsNotifyHint').textContent = '开启后会在到期日早 9:00 请求通知权限';
+    }
+
     document.getElementById('settingsModal').classList.add('show');
   }
 
@@ -2078,7 +2312,8 @@
       // 解除订阅
       if (currentRoomListener) currentRoomListener();
       currentRoomListener = null;
-      firebaseDb.ref('rooms/' + currentRoomId + '/members/' + 'me').remove().catch(() => {});
+      // 数据模型里 members 是嵌套在每个 list 下，房间根目录并没有 members 节点
+      // 这一行原本是 dead code（拼了一个永远不存在的路径），现在显式注释掉
     }
     currentRoomId = null;
     localStorage.removeItem('familyTodoRoom');
@@ -2098,6 +2333,8 @@
     currentRoomId = null;
     localStorage.removeItem('familyTodoData');
     localStorage.removeItem('familyTodoRoom');
+    // 清掉"已通知"标记，避免新数据与旧 ID 串台
+    try { localStorage.removeItem(NOTIFIED_KEY); } catch (_) {}
     state = createDefaultState();
     saveLocal();
     render();
@@ -2119,15 +2356,16 @@
     const list = getCurrentList();
     const container = document.getElementById('membersList');
     container.innerHTML = '';
+    const myId = getCurrentMemberId();
     list.members.forEach(m => {
       const row = document.createElement('div');
       row.style.cssText = 'display:flex; align-items:center; gap:12px; padding:10px 0; border-bottom:0.5px solid var(--separator);';
       row.innerHTML = `
-        <div style="width:36px; height:36px; border-radius:50%; background:${COLOR_MAP[m.color] || COLOR_MAP.gray}; display:flex; align-items:center; justify-content:center; color:white; font-weight:600; font-size:14px;">${m.name.charAt(0)}</div>
-        <div style="flex:1; font-size:16px;">${escapeHtml(m.name)}${m.id === 'me' ? '（我）' : ''}</div>
-        ${m.id !== 'me' ? '<button style="color:var(--red); border:none; background:none; font-size:14px; cursor:pointer; font-family:inherit;">移除</button>' : ''}
+        <div style="width:36px; height:36px; border-radius:50%; background:${COLOR_MAP[m.color] || COLOR_MAP.gray}; display:flex; align-items:center; justify-content:center; color:white; font-weight:600; font-size:14px;">${escapeHtml(m.name.charAt(0))}</div>
+        <div style="flex:1; font-size:16px;">${escapeHtml(m.name)}${m.id === myId ? '（我）' : ''}</div>
+        ${m.id !== myId ? '<button style="color:var(--red); border:none; background:none; font-size:14px; cursor:pointer; font-family:inherit;">移除</button>' : ''}
       `;
-      if (m.id !== 'me') {
+      if (m.id !== myId) {
         row.querySelector('button').addEventListener('click', () => {
           removeMember(m.id);
         });
@@ -2168,27 +2406,76 @@
   }
 
   function showRoomJoinModal(roomId) {
-    const list = getCurrentList();
-    const todoCount = list.todos.length;
-    const memberCount = list.members.length;
-
     const modal = document.getElementById('importModal');
-    document.getElementById('importListName').textContent = '加入共享清单';
-    document.getElementById('importSummary').textContent =
-      '加入后可实时同步所有任务和成员';
-    
+    const listNameEl = document.getElementById('importListName');
+    const summaryEl = document.getElementById('importSummary');
+
+    listNameEl.textContent = '加入共享清单';
+    summaryEl.textContent = '正在读取远端清单…';
+
     // Replace buttons for room join
     const confirmBtn = document.getElementById('importConfirmBtn');
     const mergeBtn = document.getElementById('importMergeBtn');
-    
+
     confirmBtn.textContent = '加入并同步';
     mergeBtn.textContent = '仅查看（不加入）';
+    confirmBtn.disabled = true;
 
     modal.classList.add('show');
 
+    // 拉取远端清单摘要：清单名（取第一个非空 name）、任务总数（聚合所有 list）、成员人数
+    let previewLoaded = false;
+    const finishPreview = (text, color) => {
+      if (previewLoaded) return;
+      previewLoaded = true;
+      summaryEl.textContent = text;
+      if (color) summaryEl.style.color = color;
+      confirmBtn.disabled = false;
+    };
+
+    if (firebaseDb) {
+      try {
+        firebaseDb.ref('rooms/' + roomId).once('value', (snap) => {
+          const data = snap.val();
+          if (!data || typeof data !== 'object' || !data.lists || Object.keys(data.lists).length === 0) {
+            listNameEl.textContent = '共享清单（暂无内容）';
+            finishPreview('房间目前为空，暂无任务或成员', '#999');
+            return;
+          }
+          const lists = data.lists;
+          const names = Object.keys(lists).map(k => lists[k].name).filter(Boolean);
+          listNameEl.textContent = names.length ? names[0] : '共享清单';
+          let todoCount = 0;
+          let memberSet = new Set();
+          Object.values(lists).forEach(list => {
+            if (Array.isArray(list.todos)) todoCount += list.todos.length;
+            if (Array.isArray(list.members)) {
+              list.members.forEach(m => {
+                if (m && m.id) memberSet.add(m.id);
+              });
+            }
+          });
+          finishPreview(`包含 ${todoCount} 个任务，${memberSet.size} 位成员（${memberSet.size} 个清单）`);
+        }, (err) => {
+          finishPreview('无法读取远端内容，请检查网络或房间号', '#e74c3c');
+        });
+      } catch (e) {
+        finishPreview('加入后可实时同步所有任务和成员');
+      }
+    } else {
+      finishPreview('加入后可实时同步所有任务和成员');
+    }
+
+    // 网络慢/失败时的兜底：3 秒后强制启用按钮
+    setTimeout(() => {
+      if (!previewLoaded) {
+        finishPreview('加入后可实时同步所有任务和成员');
+      }
+    }, 3000);
+
     confirmBtn.onclick = () => {
       currentRoomId = roomId;
-      localStorage.setItem('familyTodoRoom', roomId);
+      setLocal('familyTodoRoom', roomId);
       if (firebaseDb && isOnline) {
         subscribeToRoom(roomId);
       }
@@ -2393,6 +2680,31 @@
     document.getElementById('settingsLeaveBtn').addEventListener('click', () => {
       leaveRoom();
     });
+    // 通知开关
+    const notifyToggle = document.getElementById('settingsNotifyToggle');
+    const notifySlider = document.getElementById('settingsNotifyToggleSlider');
+    function applyToggleVisual(on) {
+      notifySlider.style.background = on ? 'var(--green)' : '#ccc';
+      notifyToggle.checked = on;
+    }
+    notifySlider.addEventListener('click', async () => {
+      const next = !notifyToggle.checked;
+      if (next && 'Notification' in window && Notification.permission === 'default') {
+        try { await Notification.requestPermission(); } catch (_) {}
+      }
+      if (next && 'Notification' in window && Notification.permission === 'denied') {
+        showToast('系统通知已被浏览器禁用，请到浏览器设置中开启');
+        return;
+      }
+      setNotifyEnabled(next);
+      applyToggleVisual(next);
+      if (next) {
+        scheduleReminders();
+        showToast('已开启截止日提醒');
+      } else {
+        showToast('已关闭截止日提醒');
+      }
+    });
     document.getElementById('settingsClearBtn').addEventListener('click', () => {
       clearLocalData();
     });
@@ -2458,9 +2770,29 @@
   // ============= Init =============
   function init() {
     try {
+      // 数据迁移: 把旧数据结构里硬编码的 'me' 替换为当前 clientId。
+      // 必须在 bindEvents/render 之前完成, 否则 UI 会展示一个独立 'me' 成员,
+      // 在共享房间下又会与其它客户端的 'me' 互相覆盖。
+      try {
+        if (state && state.lists) migrateLegacyMe();
+      } catch (_) {}
+
       bindEvents();
       render();
-      
+
+      // 多标签页/多窗口同步：另一个标签页写入 localStorage 后，
+      // 重新加载其状态并渲染，避免家人多设备/多标签下各自看到旧数据。
+      // 仅当本标签页当前未在房间订阅中、或本标签页处于本地模式时使用本标签页的数据
+      // ——若已订阅远端，Firebase 的 on('value') 会自然把最新数据推过来。
+      window.addEventListener('storage', (e) => {
+        if (e.key !== 'familyTodoData' || !e.newValue) return;
+        try {
+          state = normalizeState(JSON.parse(e.newValue));
+          migrateLegacyMe();
+          render();
+        } catch (_) {}
+      });
+
       // Set up room
       ensureRoom();
       
@@ -2474,6 +2806,9 @@
       loadFirebase();
       
       checkImportOnLoad();
+
+      // 初始调度提醒（render() 已经触发过一次，这里再保险一次，确保首次启动生效）
+      try { scheduleReminders(); } catch (_) {}
     } catch(e) {
       console.error('Init error:', e);
       // Fallback: try to at least render something
