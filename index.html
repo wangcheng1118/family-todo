@@ -1386,13 +1386,9 @@
   }
 
   function ensureRoom() {
-    // Try to get room from URL first
-    const urlRoom = getRoomIdFromUrl();
-    if (urlRoom) {
-      currentRoomId = urlRoom;
-      return;
-    }
-    // Try localStorage
+    // 注意：URL 中的 #room= 不在这里处理，而是由 checkImportOnLoad 弹窗让用户确认。
+    // 否则用户点"仅查看（不加入）"后 currentRoomId 仍指向该房间，
+    // Firebase 连上后会照样订阅并把本地数据推送上去、远程数据覆盖本地。
     const savedRoom = localStorage.getItem('familyTodoRoom');
     if (savedRoom) {
       currentRoomId = savedRoom;
@@ -1425,8 +1421,8 @@
 
         // If remote is newer or local is empty, use remote
         if (remoteUpdatedAt > localUpdatedAt || !state.lists || Object.keys(state.lists).length === 0) {
-          state = remoteData;
-          saveData();
+          state = normalizeState(remoteData);
+          saveLocal();
           render();
         }
       } else {
@@ -1476,12 +1472,45 @@
     }
   }
 
+  function createDefaultState() {
+    return JSON.parse(JSON.stringify(DEFAULT_DATA));
+  }
+
+  // 仅保存到本设备（localStorage），不推送 Firebase。
+  // 用于"退出房间 / 接收远端数据 / 清空本地数据"等不应回写云端的场景。
+  function saveLocal() {
+    localStorage.setItem('familyTodoData', JSON.stringify(state));
+  }
+
+  // 校验并补全数据结构：防止损坏的 localStorage 或畸形远端数据
+  // 让 getCurrentList() 返回 undefined，进而 render() 崩溃白屏。
+  function normalizeState(raw) {
+    if (!raw || typeof raw !== 'object' || !raw.lists || typeof raw.lists !== 'object') {
+      return createDefaultState();
+    }
+    Object.keys(raw.lists).forEach((key) => {
+      const list = raw.lists[key];
+      if (typeof list.name !== 'string' || !list.name) list.name = '清单';
+      if (!Array.isArray(list.todos)) list.todos = [];
+      if (!Array.isArray(list.members) || list.members.length === 0) {
+        list.members = [{ id: 'me', name: '我', color: 'blue' }];
+      }
+    });
+    if (Object.keys(raw.lists).length === 0 || !raw.lists[raw.currentListId]) {
+      raw.currentListId = Object.keys(raw.lists)[0] || 'default';
+      if (!raw.lists[raw.currentListId]) {
+        raw.lists[raw.currentListId] = createDefaultState().lists.default;
+      }
+    }
+    return raw;
+  }
+
   function loadData() {
     try {
       const raw = localStorage.getItem('familyTodoData');
-      if (raw) return JSON.parse(raw);
+      if (raw) return normalizeState(JSON.parse(raw));
     } catch(e) {}
-    return JSON.parse(JSON.stringify(DEFAULT_DATA));
+    return createDefaultState();
   }
 
   function getCurrentList() {
@@ -2061,6 +2090,12 @@
 
   function clearLocalData() {
     if (!confirm('确定要清空本地所有清单吗？\n\n如果已加入共享房间，房间里的其他成员不受影响。\n此操作不可恢复。')) return;
+    // 断开房间订阅并重置房间，避免清空后的后续编辑把默认数据推送到房间、覆盖家人数据
+    if (currentRoomListener) {
+      try { currentRoomListener(); } catch (e) {}
+      currentRoomListener = null;
+    }
+    currentRoomId = null;
     localStorage.removeItem('familyTodoData');
     localStorage.removeItem('familyTodoRoom');
     state = createDefaultState();
