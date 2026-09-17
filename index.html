@@ -174,8 +174,15 @@
     background: var(--gray5);
   }
   .nav-icon-btn-sm {
-    width: 32px;
-    height: 32px;
+    width: 36px;
+    height: 36px;
+    position: relative;
+  }
+  /* 扩大点击热区至 48px, 满足移动端最小可点面积 */
+  .nav-icon-btn-sm::after {
+    content: '';
+    position: absolute;
+    inset: -6px;
   }
 
   .sync-indicator-sm {
@@ -316,12 +323,14 @@
     -webkit-text-fill-color: transparent;
     background-clip: text;
   }
-  .stat-orange { 
+  .stat-orange {
     background: linear-gradient(135deg, var(--orange), var(--red));
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
   }
+  .stat-red { color: var(--red); }
+  .stat-red.stat-muted { color: var(--text-secondary); }
 
   /* Section header */
   .section-header {
@@ -1055,12 +1064,16 @@
 <!-- Navigation Bar -->
 <div class="nav-bar">
   <div style="display:flex; align-items:center; gap:10px;">
-    <button class="nav-icon-btn nav-icon-btn-sm" id="menuBtn" style="font-size:17px;">☰</button>
+    <button class="nav-icon-btn nav-icon-btn-sm" id="menuBtn" style="font-size:17px;" aria-label="清单菜单" title="清单菜单">☰</button>
     <div style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
       <div class="list-title" id="listTitle">家庭清单</div>
     </div>
     <div style="position:relative; flex-shrink:0;">
-      <button class="nav-icon-btn nav-icon-btn-sm" id="shareBtn" style="font-size:15px;">↗</button>
+      <button class="nav-icon-btn nav-icon-btn-sm" id="shareBtn" aria-label="分享清单" title="分享清单" style="display:flex;">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3v12"/><path d="M7 8l5-5 5 5"/><path d="M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/>
+        </svg>
+      </button>
       <div class="sync-badge offline" id="syncIndicator" title="连接中..."></div>
     </div>
   </div>
@@ -1090,8 +1103,8 @@
   <!-- Stats -->
   <div class="stats-row">
     <div class="stat-card">
-      <div class="stat-number stat-blue" id="statTotal">0</div>
-      <div class="stat-label">全部</div>
+      <div class="stat-number stat-red" id="statOverdue">0</div>
+      <div class="stat-label">逾期</div>
     </div>
     <div class="stat-card">
       <div class="stat-number stat-orange" id="statPending">0</div>
@@ -1126,12 +1139,15 @@
     <div class="empty-icon">📝</div>
     <div class="empty-title">还没有待办事项</div>
     <div class="empty-sub">点击右下角 + 号添加第一个任务</div>
+    <div style="margin-top:14px; font-size:14px;">
+      <span style="color:var(--blue); cursor:pointer; text-decoration:underline;" id="emptyShareLink">或先把清单分享给家人 →</span>
+    </div>
   </div>
 
 </div>
 
 <!-- Add Button -->
-<button class="add-btn" id="addBtn">+</button>
+<button class="add-btn" id="addBtn" aria-label="添加任务">+</button>
 
 <!-- Bottom Tab Bar -->
 <div class="tab-bar">
@@ -2025,7 +2041,14 @@
     const total = list.todos.length;
     const done = list.todos.filter(t => t.done).length;
     const pending = total - done;
-    document.getElementById('statTotal').textContent = total;
+    // 逾期 = 有截止日 + 未完成 + 截止日早于今天
+    const today = new Date(new Date().toDateString());
+    const overdue = list.todos.filter(t => t.dueDate && !t.done && new Date(t.dueDate) < today).length;
+    const overdueEl = document.getElementById('statOverdue');
+    if (overdueEl) {
+      overdueEl.textContent = overdue;
+      overdueEl.classList.toggle('stat-muted', overdue === 0);
+    }
     document.getElementById('statDone').textContent = done;
     document.getElementById('statPending').textContent = pending;
     document.getElementById('statWeekly').textContent = countWeeklyDone(list);
@@ -2803,7 +2826,13 @@
     saveBtn.textContent = todo ? '保存' : '添加';
     input.value = todo ? todo.text : '';
     selectedPriority = todo ? todo.priority : 'medium';
-    selectedAssignee = todo ? todo.assignee : '';
+    // 新任务默认分配给"我", 减少高频添加路径的点击次数
+    if (todo) {
+      selectedAssignee = todo.assignee;
+    } else {
+      const myId = getCurrentMemberId();
+      selectedAssignee = getCurrentList().members.some(m => m.id === myId) ? myId : '';
+    }
     document.getElementById('dueDateInput').value = todo ? todo.dueDate : '';
     document.getElementById('groupInput').value = todo ? (todo.group || '') : '';
 
@@ -3357,6 +3386,20 @@
   function bindEvents() {
     // Add button
     document.getElementById('addBtn').addEventListener('click', () => openTodoModal(null));
+
+    // 同步指示灯: 点按用大白话解释当前状态
+    document.getElementById('syncIndicator').addEventListener('click', () => {
+      const msgs = {
+        offline: '📴 离线模式：修改只保存在本机，联网加入房间后才与家人同步',
+        syncing: '🔄 正在与家人同步…',
+        synced: '✅ 已连接共享房间，修改实时同步给家人'
+      };
+      showToast(msgs[syncStatus] || syncStatus);
+    });
+
+    // 空状态: 分享引导
+    const emptyShare = document.getElementById('emptyShareLink');
+    if (emptyShare) emptyShare.addEventListener('click', openShareModal);
 
     // Todo modal
     document.getElementById('todoCancel').addEventListener('click', closeTodoModal);
