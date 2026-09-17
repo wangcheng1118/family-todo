@@ -1249,11 +1249,15 @@
           家人打开链接加入后，所有人实时同步
         </div>
         <div class="share-link-box" id="shareLinkBox"></div>
+        <div class="share-hint" id="shareRoomLine" style="display:none; text-align:left; font-family:monospace; margin-bottom:8px;"></div>
         <button class="share-btn-primary" id="copyLinkBtn">复制链接</button>
         <button class="share-btn-secondary" id="shareNativeBtn">分享...</button>
-        <div class="share-hint">
-          💡 提示：家人修改后也可以用同样的方式把链接发回给你，导入后就能看到最新版本。<br>
-          把网页添加到主屏幕，用起来就像 App 一样！
+        <div class="share-hint" id="shareLenWarn" style="display:none; color:var(--orange);">
+          ⚠️ 清单内容较多，链接较长，部分聊天工具可能截断，建议复制后完整粘贴
+        </div>
+        <div class="share-hint" id="shareHint">
+          💡 提示：把网页添加到主屏幕，用起来就像 App 一样！<br>
+          链接即房间钥匙，请勿转发到无关群聊。
         </div>
       </div>
     </div>
@@ -1344,7 +1348,7 @@
         </div>
         <button class="share-btn-primary" id="importConfirmBtn">导入此清单</button>
         <button class="share-btn-secondary" id="importMergeBtn">合并到当前清单</button>
-        <div class="share-hint">
+        <div class="share-hint" id="importHint">
           导入后你可以继续编辑，完成后通过分享链接把最新版本发回去。
         </div>
       </div>
@@ -2657,20 +2661,37 @@
       return location.origin + location.pathname + '#room=' + currentRoomId;
     }
     // Fallback: legacy encoded data link
+    // v2: 补全分组/重复规则字段; 分享者显式标记(s:1)并固定排在第 0 位,
+    //     保证 todos 里的 a:0 始终指向分享者, 不依赖本地成员数组顺序
     const list = getCurrentList();
+    const myId = getCurrentMemberId();
+    const members = list.members.slice();
+    const sharerIdx = members.findIndex(m => m.id === myId);
+    if (sharerIdx > 0) members.unshift(members.splice(sharerIdx, 1)[0]);
     const data = {
-      v: 1,
+      v: 2,
       name: list.name,
       color: list.color,
       icon: list.icon,
-      members: list.members.map(m => ({ n: m.name, c: m.color })),
-      todos: list.todos.map(t => ({
-        x: t.text,
-        p: t.priority,
-        a: t.assignee === getCurrentMemberId() ? 0 : list.members.findIndex(m => m.id === t.assignee),
-        d: t.dueDate || '',
-        f: t.done ? 1 : 0
-      }))
+      members: members.map((m, idx) => ({ n: m.name, c: m.color, s: idx === 0 ? 1 : 0 })),
+      todos: list.todos.map(t => {
+        let a = '';
+        if (t.assignee === myId) {
+          a = 0;
+        } else if (t.assignee) {
+          const idx = members.findIndex(m => m.id === t.assignee);
+          a = idx > 0 ? idx : ''; // 未找到时导出为"未分配", 不写入 -1
+        }
+        return {
+          x: t.text,
+          p: t.priority,
+          a: a,
+          d: t.dueDate || '',
+          f: t.done ? 1 : 0,
+          g: t.group || '',
+          r: (t.recurring && t.recurring.type) ? { t: t.recurring.type, i: t.recurring.interval || 1 } : ''
+        };
+      })
     };
     try {
       const json = JSON.stringify(data);
@@ -2726,13 +2747,16 @@
       list.members.unshift({ id: myId, name: '我', color: 'blue' });
     }
 
+    // v2 链接用 s:1 显式标记分享者; 旧版链接回退为"第 0 位是分享者"
+    const shareMembers = data.members || [];
+    let sharerIdx = shareMembers.findIndex(m => m && m.s === 1);
+    if (sharerIdx < 0) sharerIdx = 0;
+    // 分享者映射为导入方的"我"（沿用原有行为）
+    memberMap[sharerIdx] = myId;
+
     // Add other members from share
-    (data.members || []).forEach((m, idx) => {
-      if (idx === 0) {
-        // First member is the sharer - map to 本机 for them but we keep our clientId
-        // Skip or rename
-        return;
-      }
+    shareMembers.forEach((m, idx) => {
+      if (idx === sharerIdx || !m || !m.n) return;
       const existing = list.members.find(lm => lm.name === m.n);
       if (existing) {
         memberMap[idx] = existing.id;
@@ -2743,7 +2767,7 @@
       }
     });
 
-    // Import todos
+    // Import todos (v2 含分组/重复规则; 旧版链接字段缺失时回退默认值)
     (data.todos || []).forEach(t => {
       const assigneeIdx = t.a === 0 ? myId : memberMap[t.a];
       list.todos.push({
@@ -2752,6 +2776,8 @@
         priority: t.p || 'medium',
         assignee: assigneeIdx || '',
         dueDate: t.d || '',
+        group: t.g || '',
+        recurring: (t.r && t.r.t) ? normalizeRecurring({ type: t.r.t, interval: t.r.i }) : null,
         done: t.f === 1,
         createdAt: Date.now()
       });
@@ -2953,16 +2979,33 @@
   function openShareModal() {
     const link = generateShareLink();
     document.getElementById('shareLinkBox').textContent = link;
-    
-    // Update share description based on mode
+
+    // Update share description & hint based on mode
     const isRealtime = getShareMode() === 'realtime';
     const desc = document.getElementById('shareDesc');
     if (desc) {
-      desc.textContent = isRealtime 
+      desc.textContent = isRealtime
         ? '家人打开链接加入后，所有人实时同步'
-        : '家人打开链接即可加入这个共享清单';
+        : '当前为快照分享：家人看到的是此刻的清单内容，之后双方的修改不会自动同步';
     }
-    
+    const hint = document.getElementById('shareHint');
+    if (hint) {
+      hint.innerHTML = isRealtime
+        ? '💡 提示：把网页添加到主屏幕，用起来就像 App 一样！<br>链接即房间钥匙，请勿转发到无关群聊。'
+        : '💡 提示：家人修改后可以用同样的方式把链接发回给你，导入后即可看到最新版本。<br>链接中含清单内容（非加密），请注意转发范围。';
+    }
+    // 实时模式展示房间号, 便于排查同步问题
+    const roomLine = document.getElementById('shareRoomLine');
+    if (roomLine) {
+      roomLine.style.display = isRealtime ? '' : 'none';
+      if (isRealtime) roomLine.textContent = '房间号 ' + currentRoomId;
+    }
+    // 快照链接过长时提醒可能被聊天工具截断
+    const lenWarn = document.getElementById('shareLenWarn');
+    if (lenWarn) {
+      lenWarn.style.display = (!isRealtime && link.length > 1800) ? '' : 'none';
+    }
+
     document.getElementById('shareModal').classList.add('show');
   }
 
@@ -3133,6 +3176,12 @@
 
     listNameEl.textContent = '加入共享清单';
     summaryEl.textContent = '正在读取远端清单…';
+    summaryEl.style.color = '';
+    // 房间模式提示：加入后实时同步, 无需再"发回链接"
+    const joinHint = document.getElementById('importHint');
+    if (joinHint) {
+      joinHint.textContent = '加入后和家人实时同步，双方的修改即时可见。房间号：' + roomId;
+    }
 
     // Replace buttons for room join
     const confirmBtn = document.getElementById('importConfirmBtn');
@@ -3164,19 +3213,21 @@
             return;
           }
           const lists = data.lists;
+          const listCount = Object.keys(lists).length;
           const names = Object.keys(lists).map(k => lists[k].name).filter(Boolean);
           listNameEl.textContent = names.length ? names[0] : '共享清单';
           let todoCount = 0;
-          let memberSet = new Set();
+          // 成员按名字去重: 每台设备的本机成员 id 各不相同, 按 id 统计会把"我"算成多个人
+          const memberNames = new Set();
           Object.values(lists).forEach(list => {
             if (Array.isArray(list.todos)) todoCount += list.todos.length;
             if (Array.isArray(list.members)) {
               list.members.forEach(m => {
-                if (m && m.id) memberSet.add(m.id);
+                if (m && m.name) memberNames.add(m.name);
               });
             }
           });
-          finishPreview(`包含 ${todoCount} 个任务，${memberSet.size} 位成员（${memberSet.size} 个清单）`);
+          finishPreview(`包含 ${todoCount} 个任务，${memberNames.size} 位成员（${listCount} 个清单）`);
         }, (err) => {
           finishPreview('无法读取远端内容，请检查网络或房间号', '#e74c3c');
         });
@@ -3215,8 +3266,14 @@
     document.getElementById('importListName').textContent = data.name || '共享清单';
     const todoCount = (data.todos || []).length;
     const memberCount = (data.members || []).length;
-    document.getElementById('importSummary').textContent =
-      `包含 ${todoCount} 个任务，${memberCount} 位成员`;
+    const summaryEl = document.getElementById('importSummary');
+    summaryEl.textContent = `包含 ${todoCount} 个任务，${memberCount} 位成员`;
+    summaryEl.style.color = '';
+    // 恢复 legacy 导入提示（可能被房间加入弹窗改写过）
+    const importHintEl = document.getElementById('importHint');
+    if (importHintEl) {
+      importHintEl.textContent = '导入后你可以继续编辑，完成后通过分享链接把最新版本发回去。';
+    }
     
     // Reset buttons to legacy mode
     document.getElementById('importConfirmBtn').textContent = '导入此清单';
