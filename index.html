@@ -1200,6 +1200,10 @@
         </div>
         <div style="font-size:11px; color:var(--text-secondary); margin-top:6px;">完成后会自动按规则生成下一次任务</div>
       </div>
+      <div class="form-group" id="todoHistoryGroup" style="display:none;">
+        <div class="form-label">修改记录</div>
+        <div id="todoHistoryList"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -1309,7 +1313,11 @@
             <span id="settingsNotifyToggleSlider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background:#ccc; border-radius:14px; transition:.3s;"></span>
           </label>
         </div>
-        <div class="share-hint" id="settingsNotifyHint">到期日早 9:00 发送系统通知。浏览器关闭后可能失效，建议同时打开 Push 推送。</div>
+        <div id="settingsRemindHourRow" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0 0;">
+          <span style="font-size:16px;">提醒时间</span>
+          <select id="settingsRemindHour" class="form-input" style="width:auto; min-width:96px; padding:6px 10px; font-size:14px; margin:0;"></select>
+        </div>
+        <div class="share-hint" id="settingsNotifyHint"></div>
       </div>
       <div class="form-section">
         <button class="share-btn-secondary" id="settingsClearBtn" style="color:var(--red);">清空本地数据</button>
@@ -1688,6 +1696,11 @@
       if (!Array.isArray(list.members) || list.members.length === 0) {
         list.members = [{ id: getCurrentMemberId(), name: '我', color: 'blue' }];
       }
+      // 变更历史字段防御: 畸形数据直接清空, 渲染与写入层另有 Array.isArray 兜底
+      if (list.activityLog !== undefined && !Array.isArray(list.activityLog)) list.activityLog = [];
+      list.todos.forEach(t => {
+        if (t && t.history !== undefined && !Array.isArray(t.history)) t.history = [];
+      });
     });
     if (Object.keys(raw.lists).length === 0 || !raw.lists[raw.currentListId]) {
       raw.currentListId = Object.keys(raw.lists)[0] || 'default';
@@ -1726,16 +1739,21 @@
     scheduleReminders();
   }
 
-  // ============ 截止日提醒（本地通知）============
+  // ============ 截止日提醒（本地通知 + SW 后台中继）============
   // 调度策略:
-  //   - 每个有 dueDate 且未完成的任务, 计算其到期日的当天 09:00 (本地时区) 触发
-  //   - 已过期 (<= 今天 09:00) 立即触发一次, 之后不再重复
+  //   - 每个有 dueDate 且未完成的任务, 在其到期日的「提醒时间」(默认 09:00, 可在设置中
+  //     配置 06:00~22:00) 触发本地通知
+  //   - 已过期 (<= 今天提醒时间) 立即触发一次, 之后不再重复
   //   - 已提醒过的任务写入 localStorage('familyTodoNotified') 去重, 避免同一任务重复通知
-  //   - 浏览器关闭后 SW 会被休眠, 真正的"后台提醒"需要 Push API + 服务端, 此处只能保证
-  //     应用在前台/后台(浏览器未完全退出)时可靠触发, 已在 UI 上注明这一限制
-  const REMINDER_HOUR = 9;
+  //   - 页面在前台: setTimeout 调度, 到点经 Service Worker 弹系统通知
+  //   - 页面进入后台: 任务快照移交给 Service Worker, 由 SW 每 60s 轮询检查并弹通知,
+  //     覆盖"浏览器开着但页面切走了"的场景 (iOS PWA standalone 同样适用)
+  //   - 浏览器完全退出后 SW 会被系统回收, 真正的离线 Push 需要 FCM + 服务端,
+  //     已在 UI 上注明这一限制
   const NOTIFIED_KEY = 'familyTodoNotified';
   const NOTIFY_ENABLED_KEY = 'familyTodoNotifyEnabled';
+  const REMIND_HOUR_KEY = 'familyTodoRemindHour'; // 提醒时间（小时, 6~22）
+  const REMINDER_TIMEOUTS = []; // 页面侧定时器句柄, 重新调度时统一清理
 
   function getNotifyEnabled() {
     try {
@@ -1746,6 +1764,17 @@
   }
   function setNotifyEnabled(enabled) {
     setLocal(NOTIFY_ENABLED_KEY, enabled ? '1' : '0');
+  }
+  function getRemindHour() {
+    try {
+      const h = parseInt(localStorage.getItem(REMIND_HOUR_KEY), 10);
+      return (!isNaN(h) && h >= 6 && h <= 22) ? h : 9;
+    } catch (e) { return 9; }
+  }
+  function setRemindHour(h) {
+    const v = parseInt(h, 10);
+    if (isNaN(v) || v < 6 || v > 22) return;
+    setLocal(REMIND_HOUR_KEY, String(v));
   }
 
   function getNotifiedMap() {
@@ -1776,17 +1805,38 @@
     }
   }
 
-  function fireNotification(todo) {
+  function fireNotification(todo, listName) {
     if (!('Notification' in window)) return;
     if (Notification.permission !== 'granted') return;
     if (document.visibilityState === 'visible') return; // 页面已可见, 让 toast 承担
+    const title = '清单提醒：' + (todo.text || '待办');
+    const body = '截止日：' + formatDate(todo.dueDate) + (listName ? ' · ' + listName : '');
+    const opts = {
+      body: body,
+      tag: 'todo-' + todo.id,
+      renotify: true,
+      requireInteraction: false
+    };
+    // 优先通过 Service Worker 弹通知: iOS PWA (standalone) 下 new Notification() 不可用,
+    // registration.showNotification() 是唯一可靠途径, 且支持 notificationclick 聚焦
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistration()
+        .then((reg) => {
+          if (reg && reg.showNotification) {
+            reg.showNotification(title, opts);
+          } else {
+            fallbackNotification(title, opts);
+          }
+        })
+        .catch(() => fallbackNotification(title, opts));
+    } else {
+      fallbackNotification(title, opts);
+    }
+  }
+
+  function fallbackNotification(title, opts) {
     try {
-      const n = new Notification('清单提醒：' + (todo.text || '待办'), {
-        body: '截止日：' + formatDate(todo.dueDate),
-        tag: 'todo-' + todo.id,
-        renotify: true,
-        requireInteraction: false
-      });
+      const n = new Notification(title, opts);
       n.onclick = () => { try { window.focus(); } catch (_) {} n.close(); };
     } catch (e) {
       console.warn('[family-todo] 通知失败:', e);
@@ -1796,30 +1846,36 @@
   function scheduleReminders() {
     if (!state || !state.lists) return;
     if (!('Notification' in window)) return; // 不支持则直接放弃, 不影响其他功能
-    if (!getNotifyEnabled()) return; // 用户关闭
+    if (!getNotifyEnabled()) { syncRemindersToSW(); return; } // 关闭时也要通知 SW 停止
     requestNotifyPermission();
 
+    // 清理上一轮页面侧定时器, 避免重复触发
+    while (REMINDER_TIMEOUTS.length) {
+      clearTimeout(REMINDER_TIMEOUTS.pop());
+    }
+
+    const remindHour = getRemindHour();
     const now = new Date();
     const todos = [];
     Object.values(state.lists).forEach(list => {
       if (!Array.isArray(list.todos)) return;
       list.todos.forEach(t => {
         if (!t || t.done || !t.dueDate) return;
-        todos.push(t);
+        todos.push({ todo: t, listName: list.name });
       });
     });
 
-    todos.forEach(todo => {
+    todos.forEach(({ todo, listName }) => {
       const due = new Date(todo.dueDate + 'T00:00:00');
       if (isNaN(due.getTime())) return;
       const fireAt = new Date(due);
-      fireAt.setHours(REMINDER_HOUR, 0, 0, 0);
+      fireAt.setHours(remindHour, 0, 0, 0);
       const delay = fireAt.getTime() - now.getTime();
 
-      // 已过期 (今天 09:00 之前) 且未通知过 -> 立即补提醒一次
+      // 已过期 (今天提醒时间之前) 且未通知过 -> 立即补提醒一次
       if (delay <= 0) {
         if (!wasNotified(todo.id, todo.dueDate)) {
-          fireNotification(todo);
+          fireNotification(todo, listName);
           markNotified(todo.id, todo.dueDate);
         }
         return;
@@ -1828,10 +1884,8 @@
       // 改 dueDate 后回退或到期日已过, 但之前标记为已通知, 重置标记
       if (wasNotified(todo.id, todo.dueDate)) return;
 
-      // 暂存定时器 id 以便取消 (本次实现不维护 timer pool, 因为单次 setTimeout
-      // 在窗口关闭后会被回收, 简单实现更不易出错)
       try {
-        setTimeout(() => {
+        const tid = setTimeout(() => {
           if (!state || !state.lists) return;
           // 再次校验任务是否仍存在、是否未完成
           let stillExists = false;
@@ -1842,22 +1896,55 @@
             });
           });
           if (!stillExists) return;
-          fireNotification(todo);
+          fireNotification(todo, listName);
           markNotified(todo.id, todo.dueDate);
         }, Math.min(delay, 0x7fffffff));
+        REMINDER_TIMEOUTS.push(tid);
       } catch (e) {}
     });
 
     // 清理已被删除的任务标记, 避免 notified map 无限增长
     try {
       const map = getNotifiedMap();
-      const liveIds = new Set(todos.map(t => t.id));
+      const liveIds = new Set(todos.map(({ todo }) => todo.id));
       let cleaned = false;
       Object.keys(map).forEach(id => {
         if (!liveIds.has(id)) { delete map[id]; cleaned = true; }
       });
       if (cleaned) setNotifiedMap(map);
     } catch (e) {}
+
+    // 同步任务快照给 SW, 供页面后台时接管提醒
+    syncRemindersToSW();
+  }
+
+  // 将未完成且带截止日的任务快照推给 Service Worker。
+  // SW 在自身生命周期内每 60s 检查一次, 页面切到后台/手机锁屏(浏览器进程仍存活)时仍能弹通知。
+  function syncRemindersToSW() {
+    if (!('serviceWorker' in navigator) || !('Notification' in window)) return;
+    if (!state || !state.lists) return;
+    const enabled = getNotifyEnabled();
+    const todos = [];
+    if (enabled) {
+      Object.values(state.lists).forEach(list => {
+        if (!Array.isArray(list.todos)) return;
+        list.todos.forEach(t => {
+          if (!t || t.done || !t.dueDate) return;
+          todos.push({ id: t.id, text: t.text, dueDate: t.dueDate, done: false, listName: list.name });
+        });
+      });
+    }
+    navigator.serviceWorker.getRegistration().then((reg) => {
+      if (!reg || !reg.active) return;
+      if (enabled && todos.length) {
+        reg.active.postMessage({
+          type: 'SCHEDULE_REMINDERS',
+          payload: { todos: todos, remindHour: getRemindHour(), notified: getNotifiedMap() }
+        });
+      } else {
+        reg.active.postMessage({ type: 'CANCEL_REMINDERS' });
+      }
+    }).catch(() => {});
   }
 
   function renderListTitle() {
@@ -1886,6 +1973,33 @@
       });
       container.appendChild(row);
     });
+    renderRecentActivity(container);
+  }
+
+  // 侧边栏「最近动态」: 展示当前清单的操作流水 (含已删除任务的痕迹)
+  function renderRecentActivity(container) {
+    const list = getCurrentList();
+    const acts = (list && Array.isArray(list.activityLog)) ? list.activityLog.slice(-8).reverse() : [];
+    if (!acts.length) return;
+    const title = document.createElement('div');
+    title.style.cssText = 'margin:18px 0 4px; padding:0 16px; font-size:12px; font-weight:600; color:var(--text-secondary); letter-spacing:0.5px;';
+    title.textContent = '最近动态';
+    container.appendChild(title);
+    const box = document.createElement('div');
+    box.style.cssText = 'padding:0 16px;';
+    box.innerHTML = acts.map(a => {
+      const m = (list.members || []).find(x => x.id === a.by);
+      const name = m ? m.name : '成员';
+      const act = ACT_TEXT[a.act] || a.act;
+      const brief = a.ttext && a.ttext.length > 10 ? a.ttext.slice(0, 10) + '…' : (a.ttext || '');
+      return `<div style="padding:7px 0; border-bottom:0.5px solid var(--separator); font-size:13px; line-height:1.45; color:var(--text-primary);">
+        <div style="display:flex; justify-content:space-between; gap:8px;">
+          <div style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><b>${escapeHtml(name)}</b> ${escapeHtml(act)}「${escapeHtml(brief)}」</div>
+          <div style="color:var(--text-secondary); font-size:12px; white-space:nowrap;">${formatRelTime(a.at)}</div>
+        </div>
+      </div>`;
+    }).join('');
+    container.appendChild(box);
   }
 
   function renderBanner() {
@@ -2233,6 +2347,92 @@
     '家庭小能手 {name} 上线 ✨'
   ];
 
+  // ============ 数据变更历史（家庭协作审计）============
+  // 两级结构:
+  //   - todo.history: 单条任务的修改记录 (create/edit/done/undone), 任务详情弹窗中展示
+  //   - list.activityLog: 清单级操作流水 (含 delete/recur), 侧边栏「最近动态」展示;
+  //     任务被删除后 history 随之消失, 流水是唯一的追责线索
+  // 容量控制: Firebase 规则限制单次写入 payload < 100KB, 故两级各设上限, 超出裁剪最旧记录
+  const TODO_HISTORY_MAX = 20;
+  const LIST_ACTIVITY_MAX = 50;
+  const ACT_TEXT = {
+    create: '创建了任务',
+    edit: '修改了任务',
+    done: '完成了任务',
+    undone: '将任务恢复为未完成',
+    delete: '删除了任务',
+    add: '添加了任务',
+    recur: '生成了重复任务'
+  };
+  const PRIORITY_LABELS = { high: '高', medium: '中', low: '低' };
+  const RECUR_LABELS = { daily: '每天', weekly: '每周', monthly: '每月', yearly: '每年' };
+
+  function pushTodoHistory(todo, act, note) {
+    if (!todo) return;
+    if (!Array.isArray(todo.history)) todo.history = [];
+    const entry = { at: Date.now(), by: getCurrentMemberId(), act };
+    if (note) entry.note = note;
+    todo.history.push(entry);
+    if (todo.history.length > TODO_HISTORY_MAX) {
+      todo.history = todo.history.slice(-TODO_HISTORY_MAX);
+    }
+  }
+
+  function pushActivity(list, act, todo, note) {
+    if (!list) return;
+    if (!Array.isArray(list.activityLog)) list.activityLog = [];
+    const entry = {
+      at: Date.now(),
+      by: getCurrentMemberId(),
+      act,
+      tid: todo ? todo.id : '',
+      ttext: todo && todo.text ? String(todo.text).slice(0, 24) : ''
+    };
+    if (note) entry.note = note;
+    list.activityLog.push(entry);
+    if (list.activityLog.length > LIST_ACTIVITY_MAX) {
+      list.activityLog = list.activityLog.slice(-LIST_ACTIVITY_MAX);
+    }
+  }
+
+  // 计算编辑前后字段差异, 生成人类可读的变更说明 (无变化返回空串)
+  function describeTodoDiff(oldTodo, next) {
+    const changes = [];
+    if ((oldTodo.text || '') !== next.text) {
+      changes.push('内容:「' + (oldTodo.text || '无') + '」→「' + next.text + '」');
+    }
+    if (oldTodo.priority !== next.priority) {
+      changes.push('优先级:' + (PRIORITY_LABELS[oldTodo.priority] || '中') + '→' + (PRIORITY_LABELS[next.priority] || '中'));
+    }
+    if ((oldTodo.assignee || '') !== (next.assignee || '')) {
+      const oldA = oldTodo.assignee ? ((getMemberById(oldTodo.assignee) || {}).name || '成员') : '不分配';
+      const newA = next.assignee ? ((getMemberById(next.assignee) || {}).name || '成员') : '不分配';
+      changes.push('负责人:' + oldA + '→' + newA);
+    }
+    if ((oldTodo.dueDate || '') !== (next.dueDate || '')) {
+      changes.push('截止日:' + (oldTodo.dueDate ? formatDate(oldTodo.dueDate) : '无') + '→' + (next.dueDate ? formatDate(next.dueDate) : '无'));
+    }
+    if ((oldTodo.group || '') !== (next.group || '')) {
+      changes.push('分组:' + (oldTodo.group || '无') + '→' + (next.group || '无'));
+    }
+    const recurLabel = (r) => r ? (RECUR_LABELS[r.type] || r.type) + (r.interval > 1 ? '×' + r.interval : '') : '不重复';
+    if (recurLabel(oldTodo.recurring) !== recurLabel(next.recurring)) {
+      changes.push('重复:' + recurLabel(oldTodo.recurring) + '→' + recurLabel(next.recurring));
+    }
+    return changes.join('; ');
+  }
+
+  function formatRelTime(ts) {
+    if (!ts) return '';
+    const diff = Date.now() - ts;
+    if (diff < 60000) return '刚刚';
+    if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前';
+    if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前';
+    if (diff < 7 * 86400000) return Math.floor(diff / 86400000) + ' 天前';
+    const d = new Date(ts);
+    return (d.getMonth() + 1) + '/' + d.getDate();
+  }
+
   function toggleTodo(id) {
     const list = getCurrentList();
     const todo = list.todos.find(t => t.id === id);
@@ -2242,10 +2442,14 @@
       todo.done = false;
       todo.completedAt = null;
       todo.completedBy = null;
+      pushTodoHistory(todo, 'undone');
+      pushActivity(list, 'undone', todo);
     } else {
       todo.done = true;
       todo.completedAt = Date.now();
       todo.completedBy = getCurrentMemberId();
+      pushTodoHistory(todo, 'done');
+      pushActivity(list, 'done', todo);
       const me = getMemberById(todo.completedBy) || { name: '我' };
       const tpl = PRAISE_TEMPLATES[Math.floor(Math.random() * PRAISE_TEMPLATES.length)];
       showToast(tpl.replace('{name}', me.name), null, 2200);
@@ -2267,6 +2471,8 @@
             createdAt: Date.now()
           };
           list.todos.push(next);
+          pushTodoHistory(next, 'create', '由重复任务自动生成，下次到期 ' + formatDate(nextDate));
+          pushActivity(list, 'recur', next, '下次到期 ' + formatDate(nextDate));
           showToast(`下次重复任务已生成：${formatDate(nextDate)}`);
         }
       }
@@ -2323,6 +2529,8 @@
     const removed = list.todos[idx];
     const removedFromListId = list.id || state.currentListId;
     list.todos.splice(idx, 1);
+    // 任务删除后其 history 随之消失, 清单流水是唯一可追溯记录
+    pushActivity(list, 'delete', removed);
     saveData();
     render();
     const brief = removed.text.length > 12 ? removed.text.slice(0, 12) + '…' : removed.text;
@@ -2341,7 +2549,7 @@
 
   function addTodo(text, priority, assignee, dueDate, group, recurring) {
     const list = getCurrentList();
-    list.todos.push({
+    const todo = {
       id: generateTodoId(),
       text: text.trim(),
       priority,
@@ -2351,7 +2559,10 @@
       recurring: normalizeRecurring(recurring),
       done: false,
       createdAt: Date.now()
-    });
+    };
+    list.todos.push(todo);
+    pushTodoHistory(todo, 'create');
+    pushActivity(list, 'add', todo);
     saveData();
     render();
   }
@@ -2360,12 +2571,25 @@
     const list = getCurrentList();
     const todo = list.todos.find(t => t.id === id);
     if (todo) {
-      todo.text = text.trim();
-      todo.priority = priority;
-      todo.assignee = assignee;
-      todo.dueDate = dueDate;
-      todo.group = (group || '').trim();
-      todo.recurring = normalizeRecurring(recurring);
+      const next = {
+        text: text.trim(),
+        priority,
+        assignee,
+        dueDate,
+        group: (group || '').trim(),
+        recurring: normalizeRecurring(recurring)
+      };
+      const diff = describeTodoDiff(todo, next);
+      todo.text = next.text;
+      todo.priority = next.priority;
+      todo.assignee = next.assignee;
+      todo.dueDate = next.dueDate;
+      todo.group = next.group;
+      todo.recurring = next.recurring;
+      if (diff) {
+        pushTodoHistory(todo, 'edit', diff);
+        pushActivity(list, 'edit', todo, diff);
+      }
       saveData();
       render();
     }
@@ -2580,9 +2804,40 @@
     });
 
     renderAssigneeSelector();
+    renderTodoHistory(todo);
     updateTodoSaveState();
     modal.classList.add('show');
     setTimeout(() => input.focus(), 300);
+  }
+
+  // 渲染单条任务的修改记录 (最近 8 条, 倒序)
+  function renderTodoHistory(todo) {
+    const group = document.getElementById('todoHistoryGroup');
+    const box = document.getElementById('todoHistoryList');
+    if (!group || !box) return;
+    const hist = (todo && Array.isArray(todo.history)) ? todo.history : [];
+    if (!todo || hist.length === 0) {
+      group.style.display = 'none';
+      box.innerHTML = '';
+      return;
+    }
+    group.style.display = '';
+    const list = getCurrentList();
+    const rows = hist.slice(-8).reverse().map(h => {
+      const m = (list.members || []).find(x => x.id === h.by);
+      const name = m ? m.name : '成员';
+      const act = ACT_TEXT[h.act] || h.act;
+      return `<div style="padding:7px 0; border-bottom:0.5px solid var(--separator); font-size:13px; line-height:1.5;">
+        <div style="display:flex; justify-content:space-between; gap:8px;">
+          <div style="min-width:0;"><b>${escapeHtml(name)}</b> ${escapeHtml(act)}</div>
+          <div style="color:var(--text-secondary); font-size:12px; white-space:nowrap;">${formatRelTime(h.at)}</div>
+        </div>
+        ${h.note ? `<div style="color:var(--text-secondary); font-size:12px; margin-top:2px; word-break:break-all;">${escapeHtml(h.note)}</div>` : ''}
+      </div>`;
+    }).join('');
+    box.innerHTML = rows + (hist.length > 8
+      ? `<div style="font-size:12px; color:var(--text-secondary); padding-top:6px;">仅显示最近 8 条，共 ${hist.length} 条</div>`
+      : '');
   }
 
   function closeTodoModal() {
@@ -2732,6 +2987,22 @@
     const enabled = getNotifyEnabled();
     tog.checked = enabled;
     slider.style.background = enabled ? 'var(--green)' : '#ccc';
+    const hh = getRemindHour();
+    const hhLabel = String(hh).padStart(2, '0') + ':00';
+
+    // 提醒时间选择器 (06:00 ~ 22:00)
+    const hourSelect = document.getElementById('settingsRemindHour');
+    if (!hourSelect.options.length) {
+      for (let h = 6; h <= 22; h++) {
+        const opt = document.createElement('option');
+        opt.value = String(h);
+        opt.textContent = String(h).padStart(2, '0') + ':00';
+        hourSelect.appendChild(opt);
+      }
+    }
+    hourSelect.value = String(hh);
+    hourSelect.disabled = !enabled;
+
     const support = 'Notification' in window;
     if (!support) {
       tog.disabled = true;
@@ -2740,9 +3011,9 @@
     } else if (Notification.permission === 'denied') {
       document.getElementById('settingsNotifyHint').textContent = '系统通知已被浏览器禁用，请在浏览器设置中开启';
     } else if (Notification.permission === 'granted') {
-      document.getElementById('settingsNotifyHint').textContent = '到期日早 9:00 发送系统通知';
+      document.getElementById('settingsNotifyHint').textContent = '到期日 ' + hhLabel + ' 发送系统通知（页面在后台运行时也可送达）';
     } else {
-      document.getElementById('settingsNotifyHint').textContent = '开启后会在到期日早 9:00 请求通知权限';
+      document.getElementById('settingsNotifyHint').textContent = '开启后会在到期日 ' + hhLabel + ' 请求通知权限';
     }
 
     document.getElementById('settingsModal').classList.add('show');
@@ -3181,13 +3452,45 @@
       }
       setNotifyEnabled(next);
       applyToggleVisual(next);
+      const hourSelect = document.getElementById('settingsRemindHour');
+      hourSelect.disabled = !next;
+      const hhLabel = String(getRemindHour()).padStart(2, '0') + ':00';
       if (next) {
         scheduleReminders();
-        showToast('已开启截止日提醒');
+        showToast('已开启截止日提醒，' + hhLabel + ' 提醒');
       } else {
         showToast('已关闭截止日提醒');
       }
     });
+    // 提醒时间变更
+    document.getElementById('settingsRemindHour').addEventListener('change', (e) => {
+      setRemindHour(e.target.value);
+      scheduleReminders();
+      showToast('提醒时间已改为 ' + String(getRemindHour()).padStart(2, '0') + ':00');
+    });
+
+    // 页面进入后台: 把提醒调度移交给 Service Worker (覆盖切后台/锁屏场景)
+    // 页面回到前台: 收回调度权, 停止 SW 侧轮询
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        syncRemindersToSW();
+      } else {
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.getRegistration().then((reg) => {
+            if (reg && reg.active) reg.active.postMessage({ type: 'CANCEL_REMINDERS' });
+          }).catch(() => {});
+        }
+      }
+    });
+
+    // SW 弹出通知后回传标记, 页面据此更新 localStorage 去重表
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('message', (e) => {
+        if (e.data && e.data.type === 'TODO_NOTIFIED') {
+          markNotified(e.data.id, e.data.dueDate);
+        }
+      });
+    }
     document.getElementById('settingsClearBtn').addEventListener('click', () => {
       clearLocalData();
     });
