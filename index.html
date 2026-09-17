@@ -950,6 +950,11 @@
   @media (prefers-color-scheme: dark) {
     .share-link-box { background: var(--surface-elevated); }
   }
+  .share-btn-primary:disabled,
+  .share-btn-secondary:disabled {
+    opacity: 0.45;
+    pointer-events: none;
+  }
   .share-btn-primary {
     width: 100%;
     padding: 16px;
@@ -1357,6 +1362,15 @@
         <div style="margin-top:6px; font-size:13px;">
           同步状态：<span id="settingsSyncStatus">--</span>
         </div>
+        <div id="settingsRoomWarn" class="share-hint" style="display:none; color:var(--orange); text-align:left;"></div>
+      </div>
+      <div class="form-section">
+        <button class="share-btn-secondary" id="settingsJoinRoomBtn">通过房间号加入</button>
+        <div id="joinRoomRow" style="display:none; margin-top:10px;">
+          <input type="text" class="form-input" id="joinRoomInput" placeholder="房间号或家人分享的链接" style="font-size:13px; font-family:monospace;">
+          <button class="share-btn-primary" id="joinRoomConfirmBtn" style="margin-top:10px;">加入此房间</button>
+        </div>
+        <div class="share-hint">两边房间号不一致时无法同步。让对方打开分享弹窗查看房间号，粘贴到这里即可重新汇合</div>
       </div>
       <div class="form-section">
         <button class="share-btn-secondary" id="settingsLeaveBtn" style="color:var(--red);">退出当前房间</button>
@@ -1511,6 +1525,7 @@
   let firebaseApp = null;
   let firebaseDb = null;
   let currentRoomId = null;
+  let roomLostWarning = false; // 检测到"曾加入过房间但房间号丢失"(localStorage 部分被清/环境切换)
   let currentRoomListener = null; // Firebase unsubscribe function
   let isOnline = false;
   let syncStatus = 'offline'; // offline, syncing, synced
@@ -1534,6 +1549,11 @@
           }
         } else {
           setSyncStatus('offline');
+        }
+        // 分享弹窗打开时连接状态变化 → 自动刷新内容（"连接中" → 实时链接）
+        if (shareModalOpen) {
+          clearTimeout(shareConnectTimer);
+          renderShareModalContent();
         }
       });
       return true;
@@ -1635,9 +1655,18 @@
       currentRoomId = savedRoom;
       return;
     }
+    // 房间号丢失检测：之前加入过房间(有标记)且本地数据非默认 → 说明存储被部分清理，
+    // 新生成的房间号与家人不一致，需要提醒用户重新汇合
+    const hadRoom = localStorage.getItem('familyTodoHadRoom') === '1';
+    let hasUserData = false;
+    try {
+      hasUserData = JSON.stringify(state) !== JSON.stringify(createDefaultState());
+    } catch (_) {}
+    roomLostWarning = hadRoom && hasUserData;
     // Generate new room
     currentRoomId = generateRoomId();
     setLocal('familyTodoRoom', currentRoomId);
+    // 保留 familyTodoHadRoom 标记：新房间同样会被 saveData 重新记录
   }
 
   function subscribeToRoom(roomId) {
@@ -1704,6 +1733,7 @@
     // Also save room id
     if (currentRoomId) {
       setLocal('familyTodoRoom', currentRoomId);
+      setLocal('familyTodoHadRoom', '1'); // 房间号丢失检测标记
     }
     // Sync to Firebase if online
     if (isOnline && firebaseDb && currentRoomId) {
@@ -2715,11 +2745,31 @@
   }
 
   // ============= Share / Import =============
-  function generateShareLink() {
+
+  // iOS 设备检测（含 iPadOS 桌面 UA 场景）
+  function isIOSDevice() {
+    return /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  }
+
+  function generateRoomLink() {
+    return location.origin + location.pathname + '#room=' + currentRoomId;
+  }
+
+  function generateShareLink(mode) {
+    mode = mode || getShareMode();
     // If online and has room, share room link for real-time sync
-    if (isOnline && currentRoomId) {
-      return location.origin + location.pathname + '#room=' + currentRoomId;
+    if (mode === 'realtime') {
+      return generateRoomLink();
     }
+    // 连接中：不降级为快照链接，防止被分享者拿到后各自生成新房间号导致不同步
+    if (mode === 'connecting') {
+      return '';
+    }
+    return generateSnapshotLink();
+  }
+
+  function generateSnapshotLink() {
     // Fallback: legacy encoded data link
     // v2: 补全分组/重复规则字段; 分享者显式标记(s:1)并固定排在第 0 位,
     //     保证 todos 里的 a:0 始终指向分享者, 不依赖本地成员数组顺序
@@ -2765,6 +2815,9 @@
 
   function getShareMode() {
     if (isOnline && currentRoomId) return 'realtime';
+    // Firebase SDK 已就绪、浏览器有网但云端连接还没确认（.info/connected 尚未回调）
+    // → "连接中"，此时分享房间链接才安全，不应静默降级为快照链接
+    if (firebaseDb && currentRoomId && !isOnline && navigator.onLine !== false) return 'connecting';
     return 'legacy';
   }
 
@@ -3042,23 +3095,65 @@
     });
   }
 
+  let shareModalOpen = false;
+  let shareConnectTimer = null;
+
   function openShareModal() {
-    const link = generateShareLink();
-    document.getElementById('shareLinkBox').textContent = link;
+    shareModalOpen = true;
+    renderShareModalContent();
+    // 连接中：云端连上后会自动刷新；8 秒仍未连上则降级为快照分享并提示
+    clearTimeout(shareConnectTimer);
+    if (getShareMode() === 'connecting') {
+      shareConnectTimer = setTimeout(() => {
+        if (shareModalOpen && getShareMode() === 'connecting') {
+          renderShareModalContent(true);
+        }
+      }, 8000);
+    }
+    document.getElementById('shareModal').classList.add('show');
+  }
+
+  // forceLegacy: 连接超时后强制按快照模式展示
+  function renderShareModalContent(forceLegacy) {
+    let mode = getShareMode();
+    if (forceLegacy && mode === 'connecting') mode = 'legacy';
+    const isRealtime = mode === 'realtime';
+    const isConnecting = mode === 'connecting';
+    const link = generateShareLink(mode);
+
+    document.getElementById('shareLinkBox').textContent = isConnecting
+      ? '⏳ 正在连接云端同步服务…'
+      : link;
+
+    // 连接中禁用复制/系统分享按钮，防止复制到占位文案或错误链接
+    document.getElementById('copyLinkBtn').disabled = isConnecting;
+    document.getElementById('shareNativeBtn').disabled = isConnecting;
 
     // Update share description & hint based on mode
-    const isRealtime = getShareMode() === 'realtime';
     const desc = document.getElementById('shareDesc');
     if (desc) {
       desc.textContent = isRealtime
         ? '家人打开链接加入后，所有人实时同步'
-        : '当前为快照分享：家人看到的是此刻的清单内容，之后双方的修改不会自动同步';
+        : isConnecting
+          ? '正在连接云端同步服务，连上后自动生成实时同步链接'
+          : '当前为快照分享：家人看到的是此刻的清单内容，之后双方的修改不会自动同步';
     }
     const hint = document.getElementById('shareHint');
     if (hint) {
-      hint.innerHTML = isRealtime
-        ? '💡 提示：把网页添加到主屏幕，用起来就像 App 一样！<br>链接即房间钥匙，请勿转发到无关群聊。'
-        : '💡 提示：家人修改后可以用同样的方式把链接发回给你，导入后即可看到最新版本。<br>链接中含清单内容（非加密），请注意转发范围。';
+      if (isRealtime) {
+        let text = '💡 提示：把网页添加到主屏幕，用起来就像 App 一样！<br>链接即房间钥匙，请勿转发到无关群聊。';
+        if (isIOSDevice()) {
+          // iOS 上 Safari 与主屏幕 App 是两套独立存储，加入后换入口使用会"看起来不同步"
+          text += '<br>⚠️ 注意：Safari 和主屏幕 App 数据互不相通。家人加入后若换到主屏幕 App 使用，需在 App 内重新打开此链接，或到设置中输入房间号加入。';
+        }
+        hint.innerHTML = text;
+      } else if (isConnecting) {
+        hint.innerHTML = forceLegacy
+          ? '⚠️ 云端连接超时，已切换为快照分享（双方修改不会自动同步）。可关闭弹窗稍后重试，或检查网络。'
+          : '⏳ 通常几秒内即可连上，连上后这里会自动变成实时同步链接，届时再复制。';
+      } else {
+        hint.innerHTML = '💡 提示：家人修改后可以用同样的方式把链接发回给你，导入后即可看到最新版本。<br>链接中含清单内容（非加密），请注意转发范围。';
+      }
     }
     // 实时模式展示房间号, 便于排查同步问题
     const roomLine = document.getElementById('shareRoomLine');
@@ -3069,13 +3164,13 @@
     // 快照链接过长时提醒可能被聊天工具截断
     const lenWarn = document.getElementById('shareLenWarn');
     if (lenWarn) {
-      lenWarn.style.display = (!isRealtime && link.length > 1800) ? '' : 'none';
+      lenWarn.style.display = (!isRealtime && !isConnecting && link.length > 1800) ? '' : 'none';
     }
-
-    document.getElementById('shareModal').classList.add('show');
   }
 
   function closeShareModal() {
+    shareModalOpen = false;
+    clearTimeout(shareConnectTimer);
     document.getElementById('shareModal').classList.remove('show');
   }
 
@@ -3089,6 +3184,16 @@
       ? '已连接'
       : (firebaseDb ? '连接中...' : '离线');
     syncEl.style.color = firebaseDb && isOnline ? 'var(--green)' : 'var(--orange)';
+
+    // 房间号丢失警告：提示用户与家人的房间已断开，可通过下方"通过房间号加入"恢复
+    const warnEl = document.getElementById('settingsRoomWarn');
+    if (roomLostWarning) {
+      warnEl.textContent = '⚠️ 检测到之前的共享房间号已丢失（可能是浏览器清理了数据），当前是新房间，家人看不到你的更新。可点下方"通过房间号加入"重新汇合。';
+      warnEl.style.display = '';
+      roomLostWarning = false; // 提示一次即可
+    } else {
+      warnEl.style.display = 'none';
+    }
 
     // 通知开关 (视觉由 CSS :checked 驱动)
     const tog = document.getElementById('settingsNotifyToggle');
@@ -3145,6 +3250,7 @@
     }
     currentRoomId = null;
     localStorage.removeItem('familyTodoRoom');
+    localStorage.removeItem('familyTodoHadRoom'); // 主动退出不再属于任何房间，清除丢失检测标记
     history.replaceState(null, '', location.pathname);
     saveLocal();
     closeSettingsModal();
@@ -3161,6 +3267,7 @@
     currentRoomId = null;
     localStorage.removeItem('familyTodoData');
     localStorage.removeItem('familyTodoRoom');
+    localStorage.removeItem('familyTodoHadRoom');
     // 清掉"已通知"标记，避免新数据与旧 ID 串台
     try { localStorage.removeItem(NOTIFIED_KEY); } catch (_) {}
     state = createDefaultState();
@@ -3312,6 +3419,8 @@
     confirmBtn.onclick = () => {
       currentRoomId = roomId;
       setLocal('familyTodoRoom', roomId);
+      setLocal('familyTodoHadRoom', '1');
+      roomLostWarning = false; // 已重新汇合，不再提示
       if (firebaseDb && isOnline) {
         subscribeToRoom(roomId);
       }
@@ -3507,6 +3616,11 @@
     document.getElementById('shareCancel').addEventListener('click', closeShareModal);
     document.getElementById('copyLinkBtn').addEventListener('click', async () => {
       const link = document.getElementById('shareLinkBox').textContent;
+      // 兜底：连接中/链接未生成时不复制占位文案（disabled 已挡住用户点击，防御程序触发）
+      if (!/^https?:/.test(link)) {
+        showToast('链接还未生成，请稍候几秒…');
+        return;
+      }
       try {
         await navigator.clipboard.writeText(link);
         showToast('链接已复制！');
@@ -3523,6 +3637,10 @@
     });
     document.getElementById('shareNativeBtn').addEventListener('click', async () => {
       const link = document.getElementById('shareLinkBox').textContent;
+      if (!/^https?:/.test(link)) {
+        showToast('链接还未生成，请稍候几秒…');
+        return;
+      }
       if (navigator.share) {
         try {
           await navigator.share({
@@ -3568,6 +3686,43 @@
     document.getElementById('settingsCancel').addEventListener('click', closeSettingsModal);
     document.getElementById('settingsLeaveBtn').addEventListener('click', () => {
       leaveRoom();
+    });
+    // 通过房间号加入: 展开输入区
+    document.getElementById('settingsJoinRoomBtn').addEventListener('click', () => {
+      const row = document.getElementById('joinRoomRow');
+      const showing = row.style.display === 'none';
+      row.style.display = showing ? '' : 'none';
+      if (showing) {
+        const input = document.getElementById('joinRoomInput');
+        input.value = '';
+        setTimeout(() => input.focus(), 50);
+      }
+    });
+    // 解析用户输入: 支持完整链接 / room_xxx / 纯 16 位 hex
+    function parseRoomInput(raw) {
+      if (!raw) return null;
+      let s = String(raw).trim();
+      const m = s.match(/#room=([a-zA-Z0-9_-]+)/);
+      if (m) s = m[1];
+      s = s.toLowerCase();
+      if (/^room_[a-f0-9]{16}$/.test(s)) return s;
+      if (/^[a-f0-9]{16}$/.test(s)) return 'room_' + s;
+      return null;
+    }
+    document.getElementById('joinRoomConfirmBtn').addEventListener('click', () => {
+      const roomId = parseRoomInput(document.getElementById('joinRoomInput').value);
+      if (!roomId) {
+        showToast('房间号格式不对。请复制家人分享链接里的房间号（room_ 开头）');
+        return;
+      }
+      if (roomId === currentRoomId) {
+        showToast('你已在该房间中，无需重复加入');
+        document.getElementById('joinRoomRow').style.display = 'none';
+        return;
+      }
+      document.getElementById('joinRoomRow').style.display = 'none';
+      closeSettingsModal();
+      showRoomJoinModal(roomId); // 复用链接加入的预览+确认流程
     });
     // 通知开关: 监听 checkbox 的 change, 点文字/点开关都经由 label 触发, 单一事实来源
     const notifyToggle = document.getElementById('settingsNotifyToggle');
@@ -3725,6 +3880,16 @@
       loadFirebase();
       
       checkImportOnLoad();
+
+      // 房间号丢失警告：之前加入过房间但本地房间号被清（存储清理/环境切换），
+      // 新房间与家人的房间不一致会导致"看起来不同步"，引导用户重新汇合
+      if (roomLostWarning) {
+        setTimeout(() => {
+          if (roomLostWarning) {
+            showToast('检测到共享房间号丢失，已生成新房间。如家人看不到你的更新，请到设置中通过房间号重新加入', null, 6000);
+          }
+        }, 800);
+      }
 
       // 初始调度提醒（render() 已经触发过一次，这里再保险一次，确保首次启动生效）
       try { scheduleReminders(); } catch (_) {}
