@@ -1178,6 +1178,28 @@
         <div class="form-label">截止日期（可选）</div>
         <input type="date" class="form-input" id="dueDateInput">
       </div>
+      <div class="form-group">
+        <div class="form-label">分组（可选）</div>
+        <input type="text" class="form-input" id="groupInput" placeholder="例如：硬装 / 软装 / 家电" maxlength="30" list="groupHistory">
+        <datalist id="groupHistory"></datalist>
+        <div style="font-size:11px; color:var(--text-secondary); margin-top:4px;">同一清单内可按分组折叠，方便管理多步骤项目</div>
+      </div>
+      <div class="form-group">
+        <div class="form-label">重复（可选）</div>
+        <div class="segmented-control" id="recurringControl">
+          <button class="segmented-btn active" data-recur="none">不重复</button>
+          <button class="segmented-btn" data-recur="daily">每天</button>
+          <button class="segmented-btn" data-recur="weekly">每周</button>
+          <button class="segmented-btn" data-recur="monthly">每月</button>
+          <button class="segmented-btn" data-recur="yearly">每年</button>
+        </div>
+        <div id="recurIntervalWrap" style="display:none; margin-top:8px; align-items:center; gap:8px;">
+          <span style="font-size:13px; color:var(--text-secondary);">间隔</span>
+          <input type="number" min="1" max="52" value="2" id="recurInterval" style="width:60px; padding:6px 10px; border:0.5px solid var(--separator); border-radius:10px; font-size:15px;">
+          <span style="font-size:13px; color:var(--text-secondary);" id="recurIntervalUnit">周</span>
+        </div>
+        <div style="font-size:11px; color:var(--text-secondary); margin-top:6px;">完成后会自动按规则生成下一次任务</div>
+      </div>
     </div>
   </div>
 </div>
@@ -1406,6 +1428,7 @@
   let editingTodoId = null;
   let selectedPriority = 'medium';
   let selectedAssignee = '';
+  let selectedRecurring = null; // {type, interval} | null
   let selectedColor = 'blue';
   let selectedIcon = '📋';
 
@@ -1980,12 +2003,25 @@
 
   function renderTodos() {
     const list = getCurrentList();
-    const pending = list.todos.filter(t => !t.done).sort((a, b) => {
-      const order = { high: 0, medium: 1, low: 2 };
-      if (order[a.priority] !== order[b.priority]) return order[a.priority] - order[b.priority];
+    const priorityOrder = { high: 0, medium: 1, low: 2 };
+    const sortFn = (a, b) => {
+      if (priorityOrder[a.priority] !== priorityOrder[b.priority]) return priorityOrder[a.priority] - priorityOrder[b.priority];
       return b.createdAt - a.createdAt;
+    };
+
+    // 收集分组出现顺序 (按最早创建)
+    const groupOrder = [];
+    const groupMap = {};
+    list.todos.forEach(t => {
+      const g = (t.group || '').trim();
+      if (!groupMap[g]) { groupMap[g] = true; groupOrder.push(g); }
     });
-    const done = list.todos.filter(t => t.done).sort((a, b) => b.createdAt - a.createdAt);
+    // 为保证无分组任务最后出现 + 与原排序兼容: 在 groupOrder 里把 '' 放在最前(若需要)，
+    // 这里把无分组当作一个特殊独立分组渲染在最后（更符合"分组=可折叠"的语义）
+    const hasEmpty = groupOrder.some(g => g === '');
+    const namedGroups = groupOrder.filter(g => g !== '');
+    const renderOrder = namedGroups.slice();
+    if (hasEmpty) renderOrder.push('');
 
     const pendingEl = document.getElementById('pendingList');
     const doneEl = document.getElementById('doneList');
@@ -2003,8 +2039,24 @@
     }
     emptyState.style.display = 'none';
 
-    pending.forEach(todo => pendingEl.appendChild(createTodoElement(todo)));
+    // 按分组渲染 pending
+    renderOrder.forEach(groupName => {
+      const groupPending = list.todos
+        .filter(t => !t.done && (t.group || '').trim() === groupName)
+        .sort(sortFn);
+      if (groupPending.length === 0) return;
+      // 折叠状态下只显示 header, 不渲染任务
+      if (isGroupFolded(groupName)) {
+        const headerOnly = createGroupHeader(groupName, groupPending.length);
+        pendingEl.appendChild(headerOnly);
+        return;
+      }
+      pendingEl.appendChild(createGroupHeader(groupName, groupPending.length));
+      groupPending.forEach(todo => pendingEl.appendChild(createTodoElement(todo)));
+    });
 
+    // 已完成区保持扁平
+    const done = list.todos.filter(t => t.done).sort((a, b) => b.createdAt - a.createdAt);
     if (done.length > 0) {
       doneHeader.style.display = 'block';
       doneEl.style.display = 'block';
@@ -2013,6 +2065,50 @@
       doneHeader.style.display = 'none';
       doneEl.style.display = 'none';
     }
+  }
+
+  // 分组折叠状态保存在内存 + localStorage (key = listId|groupName)
+  const _groupFoldMap = (function () {
+    try {
+      const raw = localStorage.getItem('familyTodoGroupFold');
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (e) { return {}; }
+  })();
+  function getGroupFoldKey(groupName) {
+    const listId = state.currentListId || '';
+    return listId + '|' + groupName;
+  }
+  function isGroupFolded(groupName) {
+    return !!_groupFoldMap[getGroupFoldKey(groupName)];
+  }
+  function toggleGroupFold(groupName) {
+    const k = getGroupFoldKey(groupName);
+    _groupFoldMap[k] = !_groupFoldMap[k];
+    try {
+      if (Object.keys(_groupFoldMap).length === 0) localStorage.removeItem('familyTodoGroupFold');
+      else localStorage.setItem('familyTodoGroupFold', JSON.stringify(_groupFoldMap));
+    } catch (_) {}
+    render();
+  }
+
+  function createGroupHeader(groupName, count) {
+    const wrap = document.createElement('div');
+    wrap.className = 'group-header';
+    wrap.style.cssText = 'display:flex; align-items:center; justify-content:space-between; padding:14px 4px 6px 4px; color:var(--text-secondary); font-size:13px; font-weight:600;';
+    const isEmpty = groupName === '';
+    const display = isEmpty ? '未分组' : groupName;
+    const folded = isGroupFolded(groupName);
+    wrap.innerHTML = `
+      <span style="display:flex; align-items:center; gap:6px; cursor:pointer; flex:1;">
+        <span class="group-arrow" style="display:inline-block; width:14px; transition:transform 0.2s;${folded ? ' transform:rotate(-90deg);' : ''}">▼</span>
+        <span>${escapeHtml(display)}</span>
+        <span style="font-weight:400; opacity:0.7;">· ${count} 项</span>
+      </span>
+      ${isEmpty ? '' : '<span style="font-size:11px; opacity:0.6;">分组</span>'}`;
+    wrap.querySelector('span').addEventListener('click', () => toggleGroupFold(groupName));
+    return wrap;
   }
 
   function createTodoElement(todo) {
@@ -2031,11 +2127,13 @@
         <div class="todo-text">${escapeHtml(todo.text)}</div>
         <div class="todo-meta">
           <span class="priority-indicator priority-${todo.priority}"></span>
-          ${member ? `<span class="assignee-pill" style="background: ${COLOR_MAP[member.color]}15; color: ${COLOR_MAP[member.color]};"><span style="width:6px;height:6px;border-radius:50%;background:${COLOR_MAP[member.color]};display:inline-block;"></span>${escapeHtml(member.name)}</span>` : ''}
+          ${member ? `<span class="assignee-pill" style="background: ${COLOR_MAP[member.color]}15; color: ${COLOR_MAP[member.color]};"><span style="width:6px;height:6px;border-radius:50%;background:${COLOR_MAP[member.color]};display:inline-block;"></span>${escapeHtml(member.name)}</span>` : '<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">⚑ 待认领</span>'}
           ${dueDateText ? `<span class="due-date ${isOverdue ? 'overdue' : ''}">📅 ${dueDateText}</span>` : ''}
+          ${todo.recurring && todo.recurring.type ? `<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">🔁 ${({daily:'每天',weekly:'每周',monthly:'每月',yearly:'每年'})[todo.recurring.type] || '重复'}${todo.recurring.interval > 1 ? '·每 ' + todo.recurring.interval + ({daily:' 天',weekly:' 周',monthly:' 月',yearly:' 年'})[todo.recurring.type] : ''}</span>` : ''}
           ${completer ? `<span class="assignee-pill" style="background:${COLOR_MAP[completer.color] || COLOR_MAP.gray}15; color:${COLOR_MAP[completer.color] || COLOR_MAP.gray};">✓ ${escapeHtml(completer.name)} 完成</span>` : ''}
         </div>
       </div>
+      ${(!member && !todo.done) ? '<button class="todo-claim-btn" style="margin-left:8px; padding:5px 12px; border:0.5px solid var(--green); border-radius:14px; background:transparent; color:var(--green); font-size:12px; font-weight:700; cursor:pointer; font-family:inherit; flex-shrink:0;">我认领</button>' : ''}
       <div class="swipe-actions">
         <div class="swipe-btn swipe-edit">编辑</div>
         <div class="swipe-btn swipe-delete">删除</div>
@@ -2047,6 +2145,27 @@
       e.stopPropagation();
       toggleTodo(todo.id);
     });
+
+    // 「我认领」按钮：把当前成员认领为指派人（仅当未指派）
+    const claimBtn = el.querySelector('.todo-claim-btn');
+    if (claimBtn) {
+      claimBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const lst = getCurrentList();
+        const t = lst.todos.find(x => x.id === todo.id);
+        if (!t) return;
+        const myId = getCurrentMemberId();
+        // 已存在我的成员则复用, 否则插入一个
+        if (!lst.members.find(m => m.id === myId)) {
+          lst.members.unshift({ id: myId, name: getMyName(), color: 'blue' });
+        }
+        t.assignee = myId;
+        saveData();
+        render();
+        const me = getMemberById(myId);
+        showToast(`已认领给${me ? ' ' + me.name : '我'} ✋`);
+      });
+    }
 
     // Tap to edit — suppress click when a horizontal swipe occurred
     let swipeOccurred = false;
@@ -2117,23 +2236,84 @@
   function toggleTodo(id) {
     const list = getCurrentList();
     const todo = list.todos.find(t => t.id === id);
-    if (todo) {
-      if (todo.done) {
-        // 取消完成：清掉完成记录，撤销后重新完成会重新记录
-        todo.done = false;
-        todo.completedAt = null;
-        todo.completedBy = null;
-      } else {
-        todo.done = true;
-        todo.completedAt = Date.now();
-        todo.completedBy = getCurrentMemberId();
-        const me = getMemberById(todo.completedBy) || { name: '我' };
-        const tpl = PRAISE_TEMPLATES[Math.floor(Math.random() * PRAISE_TEMPLATES.length)];
-        showToast(tpl.replace('{name}', me.name), null, 2200);
+    if (!todo) return;
+    if (todo.done) {
+      // 取消完成：清掉完成记录，撤销后重新完成会重新记录
+      todo.done = false;
+      todo.completedAt = null;
+      todo.completedBy = null;
+    } else {
+      todo.done = true;
+      todo.completedAt = Date.now();
+      todo.completedBy = getCurrentMemberId();
+      const me = getMemberById(todo.completedBy) || { name: '我' };
+      const tpl = PRAISE_TEMPLATES[Math.floor(Math.random() * PRAISE_TEMPLATES.length)];
+      showToast(tpl.replace('{name}', me.name), null, 2200);
+
+      // 重复任务：勾选完成时按规则自动生成下一次实例 (不立即通知, 下次 dueDate 才调度)
+      const recur = todo.recurring;
+      if (recur && typeof recur === 'object' && recur.type) {
+        const nextDate = computeNextDueDate(todo.dueDate || '', recur);
+        if (nextDate) {
+          const next = {
+            id: generateTodoId(),
+            text: todo.text,
+            priority: todo.priority,
+            assignee: todo.assignee,
+            dueDate: nextDate,
+            group: todo.group || '',
+            recurring: { type: recur.type, interval: recur.interval || 1 },
+            done: false,
+            createdAt: Date.now()
+          };
+          list.todos.push(next);
+          showToast(`下次重复任务已生成：${formatDate(nextDate)}`);
+        }
       }
-      saveData();
-      render();
     }
+    saveData();
+    render();
+  }
+
+  // 计算重复任务的下一个到期日。
+  // type: 'daily' / 'weekly' / 'monthly' / 'yearly'; interval: 每 N 天/周/月/年。
+  // 基准日: 当前任务的 dueDate (无则今天)。
+  // 已过日跳过: 若计算出的日期 <= 基准日, 沿 type/interval 继续后移直到 > 今天。
+  function computeNextDueDate(baseDateStr, recurring) {
+    const base = baseDateStr ? new Date(baseDateStr + 'T00:00:00') : new Date(new Date().toDateString());
+    if (isNaN(base.getTime())) return null;
+    const interval = Math.max(1, parseInt(recurring.interval, 10) || 1);
+    let next = new Date(base);
+    const today = new Date(new Date().toDateString());
+    switch (recurring.type) {
+      case 'daily':
+        next.setDate(next.getDate() + interval);
+        break;
+      case 'weekly':
+        next.setDate(next.getDate() + 7 * interval);
+        break;
+      case 'monthly':
+        next.setMonth(next.getMonth() + interval);
+        break;
+      case 'yearly':
+        next.setFullYear(next.getFullYear() + interval);
+        break;
+      default:
+        return null;
+    }
+    // 防止"今天完成 → 算出下次还是今天/过去"导致永远卡住
+    while (next <= today) {
+      switch (recurring.type) {
+        case 'daily': next.setDate(next.getDate() + interval); break;
+        case 'weekly': next.setDate(next.getDate() + 7 * interval); break;
+        case 'monthly': next.setMonth(next.getMonth() + interval); break;
+        case 'yearly': next.setFullYear(next.getFullYear() + interval); break;
+      }
+    }
+    const y = next.getFullYear();
+    const m = String(next.getMonth() + 1).padStart(2, '0');
+    const d = String(next.getDate()).padStart(2, '0');
+    return y + '-' + m + '-' + d;
   }
 
   function deleteTodo(id) {
@@ -2159,7 +2339,7 @@
     }, 5000);
   }
 
-  function addTodo(text, priority, assignee, dueDate) {
+  function addTodo(text, priority, assignee, dueDate, group, recurring) {
     const list = getCurrentList();
     list.todos.push({
       id: generateTodoId(),
@@ -2167,6 +2347,8 @@
       priority,
       assignee,
       dueDate,
+      group: (group || '').trim(),
+      recurring: normalizeRecurring(recurring),
       done: false,
       createdAt: Date.now()
     });
@@ -2174,7 +2356,7 @@
     render();
   }
 
-  function updateTodo(id, text, priority, assignee, dueDate) {
+  function updateTodo(id, text, priority, assignee, dueDate, group, recurring) {
     const list = getCurrentList();
     const todo = list.todos.find(t => t.id === id);
     if (todo) {
@@ -2182,9 +2364,19 @@
       todo.priority = priority;
       todo.assignee = assignee;
       todo.dueDate = dueDate;
+      todo.group = (group || '').trim();
+      todo.recurring = normalizeRecurring(recurring);
       saveData();
       render();
     }
+  }
+
+  function normalizeRecurring(r) {
+    if (!r || typeof r !== 'object') return null;
+    const validTypes = { daily: 1, weekly: 1, monthly: 1, yearly: 1 };
+    if (!validTypes[r.type]) return null;
+    const interval = Math.max(1, parseInt(r.interval, 10) || 1);
+    return { type: r.type, interval };
   }
 
   function addList(name, color, icon) {
@@ -2363,6 +2555,24 @@
     selectedPriority = todo ? todo.priority : 'medium';
     selectedAssignee = todo ? todo.assignee : '';
     document.getElementById('dueDateInput').value = todo ? todo.dueDate : '';
+    document.getElementById('groupInput').value = todo ? (todo.group || '') : '';
+
+    // 填充本清单的历史分组供 datalist 自动提示
+    const dl = document.getElementById('groupHistory');
+    dl.innerHTML = '';
+    const seen = new Set();
+    getCurrentList().todos.forEach(t => {
+      if (t && t.group && !seen.has(t.group)) {
+        seen.add(t.group);
+        const opt = document.createElement('option');
+        opt.value = t.group;
+        dl.appendChild(opt);
+      }
+    });
+
+    // 重复设置初始化
+    selectedRecurring = (todo && todo.recurring) ? { ...todo.recurring } : null;
+    updateRecurringUI();
 
     // Update segmented control
     document.querySelectorAll('#todoModal .segmented-btn').forEach(btn => {
@@ -2384,6 +2594,24 @@
     const text = document.getElementById('todoInput').value.trim();
     const saveBtn = document.getElementById('todoSave');
     saveBtn.classList.toggle('disabled', !text);
+  }
+
+  const RECUR_UNITS = { daily: '天', weekly: '周', monthly: '月', yearly: '年' };
+  function updateRecurringUI() {
+    document.querySelectorAll('#recurringControl .segmented-btn').forEach(btn => {
+      const t = btn.dataset.recur;
+      const active = (!selectedRecurring && t === 'none') ||
+        (selectedRecurring && selectedRecurring.type === t);
+      btn.classList.toggle('active', !!active);
+    });
+    const wrap = document.getElementById('recurIntervalWrap');
+    if (selectedRecurring && selectedRecurring.type !== 'none') {
+      wrap.style.display = 'flex';
+      document.getElementById('recurInterval').value = selectedRecurring.interval || 1;
+      document.getElementById('recurIntervalUnit').textContent = RECUR_UNITS[selectedRecurring.type] || '';
+    } else {
+      wrap.style.display = 'none';
+    }
   }
 
   function renderAssigneeSelector() {
@@ -2809,11 +3037,12 @@
       const text = document.getElementById('todoInput').value.trim();
       if (!text) return;
       const dueDate = document.getElementById('dueDateInput').value;
+      const group = document.getElementById('groupInput').value.trim();
       if (editingTodoId) {
-        updateTodo(editingTodoId, text, selectedPriority, selectedAssignee, dueDate);
+        updateTodo(editingTodoId, text, selectedPriority, selectedAssignee, dueDate, group, selectedRecurring);
         showToast('已更新');
       } else {
-        addTodo(text, selectedPriority, selectedAssignee, dueDate);
+        addTodo(text, selectedPriority, selectedAssignee, dueDate, group, selectedRecurring);
         showToast('已添加');
       }
       closeTodoModal();
@@ -2827,6 +3056,23 @@
           b.classList.toggle('active', b.dataset.priority === selectedPriority)
         );
       });
+    });
+
+    // Recurring segmented
+    document.querySelectorAll('#recurringControl .segmented-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const t = btn.dataset.recur;
+        if (t === 'none') { selectedRecurring = null; }
+        else {
+          const interval = parseInt(document.getElementById('recurInterval').value, 10) || 1;
+          selectedRecurring = { type: t, interval };
+        }
+        updateRecurringUI();
+      });
+    });
+    document.getElementById('recurInterval').addEventListener('input', () => {
+      if (!selectedRecurring) return;
+      selectedRecurring.interval = Math.max(1, parseInt(document.getElementById('recurInterval').value, 10) || 1);
     });
 
     // List modal
