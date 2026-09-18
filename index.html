@@ -1527,6 +1527,7 @@
   let currentRoomId = null;
   let roomLostWarning = false; // 检测到"曾加入过房间但房间号丢失"(localStorage 部分被清/环境切换)
   let currentRoomListener = null; // Firebase unsubscribe function
+  let rejoinIntent = false; // 用户主动点击"加入并同步"的意图标记：允许清除自己的移除标记重新进房
   let isOnline = false;
   let syncStatus = 'offline'; // offline, syncing, synced
   let isLocalChange = false; // prevent loop when applying remote changes
@@ -1669,6 +1670,9 @@
     let changed = false;
     Object.values(state.lists).forEach(list => {
       if (!list || !Array.isArray(list.members)) return;
+      // 0) 我在该清单的移除标记(墓碑)里 → 这是管理员主动移除，不是竞态丢失身份，
+      //    不再自愈注册（否则对方永远移除不掉我）
+      if (list.removedMembers && list.removedMembers[myId]) return;
       // 1) 他人名为"我" → 改为可区分的占位名
       list.members.forEach(m => {
         if (m && m.name === '我' && m.id !== myId) {
@@ -1748,6 +1752,31 @@
           const prevMyName = getMyName(); // 覆盖前保存本机身份名，避免被远端数据冲掉
           state = normalizeState(remoteData);
           migrateLegacyMe();
+          const myId = getCurrentMemberId();
+
+          // 主动（重新）加入意图：清除针对我的移除标记（被移除者拿邀请链接重新进门）
+          if (rejoinIntent) {
+            rejoinIntent = false; // 单次意图，用完即清
+            Object.values(state.lists).forEach(list => {
+              if (list && list.removedMembers && list.removedMembers[myId]) {
+                delete list.removedMembers[myId];
+              }
+            });
+          }
+
+          // 被移除检测：所有清单都不含我 + 至少一个清单有我的墓碑 → 被管理员移出房间
+          // （部分清单被移除时不退房，仅由 ensureMyMembership 跳过该清单的身份注册）
+          const stillTombstoned = Object.values(state.lists).some(
+            l => l && l.removedMembers && l.removedMembers[myId]
+          );
+          const inAnyList = Object.values(state.lists).some(
+            l => Array.isArray(l.members) && l.members.some(m => m && m.id === myId)
+          );
+          if (!inAnyList && stillTombstoned) {
+            handleRemovedFromRoom();
+            return;
+          }
+
           // 身份自注册：本机 clientId 不在共享成员表 → 注入条目并回推，
           // 让房间其他人看到"我"加入；否则"我"在房间里根本不存在
           if (ensureMyMembership(prevMyName)) {
@@ -1845,6 +1874,10 @@
       if (!Array.isArray(list.todos)) list.todos = [];
       if (!Array.isArray(list.members) || list.members.length === 0) {
         list.members = [{ id: getCurrentMemberId(), name: '我', color: 'blue' }];
+      }
+      // 移除标记(墓碑)字段防御: 畸形数据重置为空对象; 空对象经 Firebase 序列化会自然消失, 无副作用
+      if (!list.removedMembers || typeof list.removedMembers !== 'object' || Array.isArray(list.removedMembers)) {
+        list.removedMembers = {};
       }
       // 变更历史字段防御: 畸形数据直接清空, 渲染与写入层另有 Array.isArray 兜底
       if (list.activityLog !== undefined && !Array.isArray(list.activityLog)) list.activityLog = [];
@@ -3301,6 +3334,25 @@
     document.getElementById('settingsModal').classList.remove('show');
   }
 
+  // 被管理员移出房间：自动退房（无确认弹窗），本地数据保留切回单机模式。
+  // 由 subscribeToRoom 检测到墓碑后调用；此时 state 已被远端数据覆盖，勿再回推云端。
+  function handleRemovedFromRoom() {
+    if (currentRoomListener) {
+      try { currentRoomListener(); } catch (e) {}
+      currentRoomListener = null;
+    }
+    currentRoomId = null;
+    try {
+      localStorage.removeItem('familyTodoRoom');
+      localStorage.removeItem('familyTodoHadRoom');
+    } catch (e) {}
+    history.replaceState(null, '', location.pathname);
+    saveLocal(); // 保留被移除后的数据快照，供单机继续使用
+    render();
+    setSyncStatus('offline');
+    showToast('你已被移出共享清单，已切换为本机模式（数据已保留）。如需回来，请让家人重新发送邀请链接', null, 6000);
+  }
+
   function leaveRoom() {
     if (!currentRoomId) {
       showToast('当前未加入房间');
@@ -3367,7 +3419,22 @@
         ${m.id !== myId ? '<button style="color:var(--red); border:none; background:none; font-size:14px; cursor:pointer; font-family:inherit;">移除</button>' : ''}
       `;
       if (m.id !== myId) {
-        row.querySelector('button').addEventListener('click', () => {
+        const btn = row.querySelector('button');
+        let armed = false, disarmTimer = null;
+        btn.addEventListener('click', () => {
+          if (!armed) {
+            // 两段式确认：移除会导致对方退出共享（需重新邀请），防误触
+            armed = true;
+            btn.textContent = '确认移除';
+            btn.style.fontWeight = '600';
+            disarmTimer = setTimeout(() => {
+              armed = false;
+              btn.textContent = '移除';
+              btn.style.fontWeight = '';
+            }, 3000);
+            return;
+          }
+          clearTimeout(disarmTimer);
           removeMember(m.id);
         });
       }
@@ -3377,7 +3444,15 @@
 
   function removeMember(id) {
     const list = getCurrentList();
+    const member = list.members.find(m => m.id === id);
+    const memberName = member ? member.name : '成员';
     list.members = list.members.filter(m => m.id !== id);
+    // 墓碑：标记"被主动移除"。对方设备的身份自愈机制(ensureMyMembership)
+    // 看到此标记后不再把自己加回来，并自动退出房间
+    if (!list.removedMembers || typeof list.removedMembers !== 'object' || Array.isArray(list.removedMembers)) {
+      list.removedMembers = {};
+    }
+    list.removedMembers[id] = Date.now();
     // Unassign todos from this member
     list.todos.forEach(t => {
       if (t.assignee === id) t.assignee = '';
@@ -3385,6 +3460,7 @@
     saveData();
     render();
     renderMembersList();
+    showToast('已移除 ' + memberName + '，对方将退出共享。如需回来需重新点击邀请链接');
   }
 
   function toggleListsOverlay(show) {
@@ -3487,6 +3563,7 @@
       setLocal('familyTodoRoom', roomId);
       setLocal('familyTodoHadRoom', '1');
       roomLostWarning = false; // 已重新汇合，不再提示
+      rejoinIntent = true; // 主动加入：允许清除我的移除标记（被移除者重新进门的唯一途径）
       if (firebaseDb && isOnline) {
         subscribeToRoom(roomId);
       }
