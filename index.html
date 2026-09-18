@@ -522,6 +522,37 @@
   .todo-item.swiped .todo-body { opacity: 0.6; }
 
   /* Empty state */
+  /* 成员筛选 chips: 横向滚动胶囊行 */
+  .member-chips {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding: 2px 0 6px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .member-chips::-webkit-scrollbar { display: none; }
+  .member-chip {
+    flex-shrink: 0;
+    padding: 6px 14px;
+    border-radius: 16px;
+    font-size: 13px;
+    font-weight: 500;
+    background: var(--card);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: all .15s ease;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .member-chip.active {
+    background: var(--blue);
+    color: #fff;
+    border-color: var(--blue);
+    font-weight: 600;
+  }
+
   .empty-state {
     text-align: center;
     padding: 80px 20px;
@@ -1168,6 +1199,9 @@
     </div>
   </div>
 
+  <!-- Member Filter Chips -->
+  <div class="member-chips" id="memberChips" style="display:none;"></div>
+
   <!-- Pending Section -->
   <div class="section-header">待完成</div>
   <div class="todo-group" id="pendingList"></div>
@@ -1184,6 +1218,13 @@
     <div style="margin-top:14px; font-size:14px;">
       <span style="color:var(--blue); cursor:pointer; text-decoration:underline;" id="emptyShareLink">或先把清单分享给家人 →</span>
     </div>
+  </div>
+
+  <!-- Filter Empty State: 筛选某成员后无任务 -->
+  <div class="empty-state" id="filterEmptyState" style="display:none;">
+    <div class="empty-icon">🫧</div>
+    <div class="empty-title" id="filterEmptyTitle">该成员还没有待办</div>
+    <div class="empty-sub" id="filterEmptySub">点击"全部"查看清单所有任务</div>
   </div>
 
 </div>
@@ -1917,6 +1958,7 @@
     renderListsPanel();
     renderBanner();
     renderStats();
+    renderMemberChips();
     renderTodos();
     // 任何 state 变化都重新调度提醒, 保证新增/删除/改 dueDate 立即生效
     scheduleReminders();
@@ -2231,6 +2273,61 @@
     container.appendChild(box);
   }
 
+  // ============ 成员筛选 (纯本地视图偏好, 不同步到共享数据) ============
+  const MEMBER_FILTER_KEY = 'familyTodoMemberFilter';
+
+  function getMemberFilter() {
+    try { return localStorage.getItem(MEMBER_FILTER_KEY) || 'all'; } catch (e) { return 'all'; }
+  }
+  function setMemberFilter(v) {
+    try { localStorage.setItem(MEMBER_FILTER_KEY, v); } catch (e) {}
+  }
+
+  // 解析有效筛选值: 'me' → 本机 clientId; memberId → 校验仍在成员表(被移除/清单切换后回落)
+  function getValidMemberFilter(list) {
+    const raw = getMemberFilter();
+    if (raw === 'all') return 'all';
+    if (raw === 'me') return getCurrentMemberId();
+    const exists = Array.isArray(list.members) && list.members.some(m => m && m.id === raw);
+    return exists ? raw : 'all';
+  }
+
+  function applyMemberFilter(todos, filterVal) {
+    if (!filterVal || filterVal === 'all') return todos;
+    return todos.filter(t => t && t.assignee === filterVal);
+  }
+
+  function renderMemberChips() {
+    const list = getCurrentList();
+    const wrap = document.getElementById('memberChips');
+    if (!wrap) return;
+    // 单人清单无需筛选
+    if (!Array.isArray(list.members) || list.members.length <= 1) {
+      wrap.style.display = 'none';
+      wrap.innerHTML = '';
+      return;
+    }
+    const filterVal = getValidMemberFilter(list);
+    wrap.style.display = 'flex';
+    wrap.innerHTML = '';
+    const mkChip = (val, label) => {
+      const chip = document.createElement('div');
+      chip.className = 'member-chip' + (filterVal === val ? ' active' : '');
+      chip.textContent = label;
+      chip.addEventListener('click', () => {
+        setMemberFilter(val === getCurrentMemberId() ? 'me' : val);
+        renderTodos();
+        renderMemberChips();
+      });
+      wrap.appendChild(chip);
+    };
+    mkChip('all', '全部');
+    mkChip(getCurrentMemberId(), '我的');
+    list.members.forEach(m => {
+      if (m && m.id !== getCurrentMemberId()) mkChip(m.id, displayName(m));
+    });
+  }
+
   function renderBanner() {
     const list = getCurrentList();
     const avatars = document.getElementById('bannerAvatars');
@@ -2359,10 +2456,14 @@
       return b.createdAt - a.createdAt;
     };
 
-    // 收集分组出现顺序 (按最早创建)
+    // 成员筛选: 纯本地视图偏好, 组内过滤(保留分组结构), 已完成区跟随
+    const filterVal = getValidMemberFilter(list);
+    const filteredTodos = applyMemberFilter(list.todos, filterVal);
+
+    // 收集分组出现顺序 (按最早创建, 基于筛选后数据——过滤后为空的分组整体隐藏)
     const groupOrder = [];
     const groupMap = {};
-    list.todos.forEach(t => {
+    filteredTodos.forEach(t => {
       const g = (t.group || '').trim();
       if (!groupMap[g]) { groupMap[g] = true; groupOrder.push(g); }
     });
@@ -2377,21 +2478,35 @@
     const doneEl = document.getElementById('doneList');
     const doneHeader = document.getElementById('doneHeader');
     const emptyState = document.getElementById('emptyState');
+    const filterEmptyState = document.getElementById('filterEmptyState');
 
     pendingEl.innerHTML = '';
     doneEl.innerHTML = '';
 
     if (list.todos.length === 0) {
       emptyState.style.display = 'block';
+      filterEmptyState.style.display = 'none';
       doneHeader.style.display = 'none';
       doneEl.style.display = 'none';
       return;
     }
     emptyState.style.display = 'none';
 
+    // 全量非空但筛选后为空 → 筛选空状态
+    if (filteredTodos.length === 0) {
+      const member = list.members.find(m => m && m.id === filterVal);
+      const memberName = member ? displayName(member) : '该成员';
+      document.getElementById('filterEmptyTitle').textContent = memberName + '还没有待办';
+      filterEmptyState.style.display = 'block';
+      doneHeader.style.display = 'none';
+      doneEl.style.display = 'none';
+      return;
+    }
+    filterEmptyState.style.display = 'none';
+
     // 按分组渲染 pending
     renderOrder.forEach(groupName => {
-      const groupPending = list.todos
+      const groupPending = filteredTodos
         .filter(t => !t.done && (t.group || '').trim() === groupName)
         .sort(sortFn);
       if (groupPending.length === 0) return;
@@ -2405,8 +2520,8 @@
       groupPending.forEach(todo => pendingEl.appendChild(createTodoElement(todo)));
     });
 
-    // 已完成区保持扁平
-    const done = list.todos.filter(t => t.done).sort((a, b) => b.createdAt - a.createdAt);
+    // 已完成区保持扁平 (跟随筛选)
+    const done = filteredTodos.filter(t => t.done).sort((a, b) => b.createdAt - a.createdAt);
     if (done.length > 0) {
       doneHeader.style.display = 'block';
       doneEl.style.display = 'block';
@@ -2477,7 +2592,7 @@
         <div class="todo-text">${escapeHtml(todo.text)}</div>
         <div class="todo-meta">
           <span class="priority-indicator priority-${todo.priority}"></span>
-          ${member ? `<span class="assignee-pill" style="background: ${COLOR_MAP[member.color]}15; color: ${COLOR_MAP[member.color]};"><span style="width:6px;height:6px;border-radius:50%;background:${COLOR_MAP[member.color]};display:inline-block;"></span>${escapeHtml(displayName(member))}</span>` : '<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">⚑ 待认领</span>'}
+          ${member ? `<span class="assignee-pill" data-assignee="${escapeHtml(member.id)}" style="background: ${COLOR_MAP[member.color]}15; color: ${COLOR_MAP[member.color]}; cursor:pointer;" title="点击筛选 TA 的任务"><span style="width:6px;height:6px;border-radius:50%;background:${COLOR_MAP[member.color]};display:inline-block;"></span>${escapeHtml(displayName(member))}</span>` : '<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">⚑ 待认领</span>'}
           ${dueDateText ? `<span class="due-date ${isOverdue ? 'overdue' : ''}">📅 ${dueDateText}</span>` : ''}
           ${todo.recurring && todo.recurring.type ? `<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">🔁 ${({daily:'每天',weekly:'每周',monthly:'每月',yearly:'每年'})[todo.recurring.type] || '重复'}${todo.recurring.interval > 1 ? '·每 ' + todo.recurring.interval + ({daily:' 天',weekly:' 周',monthly:' 月',yearly:' 年'})[todo.recurring.type] : ''}</span>` : ''}
           ${completer ? `<span class="assignee-pill" style="background:${COLOR_MAP[completer.color] || COLOR_MAP.gray}15; color:${COLOR_MAP[completer.color] || COLOR_MAP.gray};">✓ ${escapeHtml(displayName(completer))} 完成</span>` : ''}
@@ -2489,6 +2604,17 @@
         <div class="swipe-btn swipe-delete">删除</div>
       </div>
     `;
+
+    // 点击负责人 pill → 快速筛选该成员的任务
+    const assigneePill = el.querySelector('.assignee-pill[data-assignee]');
+    if (assigneePill) {
+      assigneePill.addEventListener('click', (e) => {
+        e.stopPropagation();
+        setMemberFilter(todo.assignee === getCurrentMemberId() ? 'me' : todo.assignee);
+        renderTodos();
+        renderMemberChips();
+      });
+    }
 
     // Checkbox click
     el.querySelector('.todo-checkbox').addEventListener('click', (e) => {

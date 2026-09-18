@@ -1,6 +1,6 @@
 // Service Worker for Family Todo PWA
 // 版本号：每次发布新版 index.html 时必须修改 (v2, v3, ...)
-const CACHE_NAME = 'family-todo-v16';
+const CACHE_NAME = 'family-todo-v17';
 const urlsToCache = [
   './',
   './index.html',
