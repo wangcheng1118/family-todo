@@ -1640,6 +1640,60 @@
     return changed;
   }
 
+  // ============= 共享身份模型 =============
+  // 原则：members 是共享的"绝对身份"（每人一个条目，名字在房间内可区分），
+  // "我"是相对视角词——只在显示层由 displayName 渲染，绝不能作为
+  // 共享数据里的成员名（否则所有人看到的"我"都会是同一个人）。
+
+  function displayName(m) {
+    if (!m) return '成员';
+    return m.id === getCurrentMemberId() ? '我' : (m.name || '成员');
+  }
+
+  // 生成房间内不冲突的成员占位名："成员1"、"成员2"…
+  function generateMemberName(list) {
+    const existing = new Set((list.members || []).map(m => m && m.name));
+    let n = 1;
+    while (existing.has('成员' + n)) n++;
+    return '成员' + n;
+  }
+
+  // 确保本机身份在共享成员表中有自己的条目（加入房间后远端数据覆盖本地时，
+  // 本机的 clientId 不在 members 里 → 自动注册，让所有人都能看到"我"加入）。
+  // 同时把他人名为"我"的条目改为可区分的占位名（对方自己界面上仍显示"我"，
+  // 由 displayName 处理，无感知）。
+  // fallbackName: 覆盖前本机保存的身份名（若有真名则保留，避免被远端冲掉）。
+  // 返回是否有数据变更，调用方据此决定是否回推云端。
+  function ensureMyMembership(fallbackName) {
+    const myId = getCurrentMemberId();
+    let changed = false;
+    Object.values(state.lists).forEach(list => {
+      if (!list || !Array.isArray(list.members)) return;
+      // 1) 他人名为"我" → 改为可区分的占位名
+      list.members.forEach(m => {
+        if (m && m.name === '我' && m.id !== myId) {
+          m.name = generateMemberName(list);
+          changed = true;
+        }
+      });
+      // 2) 我不在成员表 → 注入自己的条目
+      if (!list.members.find(m => m.id === myId)) {
+        const colors = ['orange','green','purple','pink','teal','indigo','red','yellow'];
+        const used = list.members.map(m => m.color);
+        const myName = (fallbackName && fallbackName !== '我')
+          ? fallbackName
+          : generateMemberName(list);
+        list.members.push({
+          id: myId,
+          name: myName,
+          color: colors.find(c => !used.includes(c)) || colors[list.members.length % colors.length]
+        });
+        changed = true;
+      }
+    });
+    return changed;
+  }
+
   function getRoomIdFromUrl() {
     const hash = location.hash;
     const match = hash.match(/#room=([a-zA-Z0-9_-]+)/);
@@ -1691,8 +1745,17 @@
 
         // If remote is newer or local is empty, use remote
         if (remoteUpdatedAt > localUpdatedAt || !state.lists || Object.keys(state.lists).length === 0) {
+          const prevMyName = getMyName(); // 覆盖前保存本机身份名，避免被远端数据冲掉
           state = normalizeState(remoteData);
           migrateLegacyMe();
+          // 身份自注册：本机 clientId 不在共享成员表 → 注入条目并回推，
+          // 让房间其他人看到"我"加入；否则"我"在房间里根本不存在
+          if (ensureMyMembership(prevMyName)) {
+            saveLocal();
+            render();
+            pushToFirebase();
+            return;
+          }
           saveLocal();
           render();
         }
@@ -2076,7 +2139,7 @@
     box.style.cssText = 'padding:0 16px;';
     box.innerHTML = acts.map(a => {
       const m = (list.members || []).find(x => x.id === a.by);
-      const name = m ? m.name : '成员';
+      const name = displayName(m);
       const act = ACT_TEXT[a.act] || a.act;
       const brief = a.ttext && a.ttext.length > 10 ? a.ttext.slice(0, 10) + '…' : (a.ttext || '');
       return `<div style="padding:7px 0; border-bottom:0.5px solid var(--separator); font-size:13px; line-height:1.45; color:var(--text-primary);">
@@ -2096,7 +2159,7 @@
     list.members.slice(0, 4).forEach((m, i) => {
       const div = document.createElement('div');
       div.className = 'member-avatar ' + (i === 0 ? 'avatar-me' : 'avatar-' + i);
-      div.textContent = m.name.charAt(0);
+      div.textContent = displayName(m).charAt(0);
       avatars.appendChild(div);
     });
     document.getElementById('bannerText').textContent =
@@ -2173,8 +2236,8 @@
         row.style.cssText = 'display:flex; align-items:center; gap:10px; padding:8px 0;';
         row.innerHTML = `
           <span style="font-size:16px; width:24px; text-align:center;">${medal}</span>
-          <div style="width:32px; height:32px; border-radius:50%; background:${COLOR_MAP[m.color] || COLOR_MAP.gray}; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:600; font-size:13px;">${escapeHtml(m.name.charAt(0))}</div>
-          <div style="flex:1; font-size:15px;">${escapeHtml(m.name)}</div>
+          <div style="width:32px; height:32px; border-radius:50%; background:${COLOR_MAP[m.color] || COLOR_MAP.gray}; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:600; font-size:13px;">${escapeHtml(displayName(m).charAt(0))}</div>
+          <div style="flex:1; font-size:15px;">${escapeHtml(displayName(m))}</div>
           <div style="font-weight:700; color:var(--green);">${n} 项</div>`;
         board.appendChild(row);
       });
@@ -2335,10 +2398,10 @@
         <div class="todo-text">${escapeHtml(todo.text)}</div>
         <div class="todo-meta">
           <span class="priority-indicator priority-${todo.priority}"></span>
-          ${member ? `<span class="assignee-pill" style="background: ${COLOR_MAP[member.color]}15; color: ${COLOR_MAP[member.color]};"><span style="width:6px;height:6px;border-radius:50%;background:${COLOR_MAP[member.color]};display:inline-block;"></span>${escapeHtml(member.name)}</span>` : '<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">⚑ 待认领</span>'}
+          ${member ? `<span class="assignee-pill" style="background: ${COLOR_MAP[member.color]}15; color: ${COLOR_MAP[member.color]};"><span style="width:6px;height:6px;border-radius:50%;background:${COLOR_MAP[member.color]};display:inline-block;"></span>${escapeHtml(displayName(member))}</span>` : '<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">⚑ 待认领</span>'}
           ${dueDateText ? `<span class="due-date ${isOverdue ? 'overdue' : ''}">📅 ${dueDateText}</span>` : ''}
           ${todo.recurring && todo.recurring.type ? `<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">🔁 ${({daily:'每天',weekly:'每周',monthly:'每月',yearly:'每年'})[todo.recurring.type] || '重复'}${todo.recurring.interval > 1 ? '·每 ' + todo.recurring.interval + ({daily:' 天',weekly:' 周',monthly:' 月',yearly:' 年'})[todo.recurring.type] : ''}</span>` : ''}
-          ${completer ? `<span class="assignee-pill" style="background:${COLOR_MAP[completer.color] || COLOR_MAP.gray}15; color:${COLOR_MAP[completer.color] || COLOR_MAP.gray};">✓ ${escapeHtml(completer.name)} 完成</span>` : ''}
+          ${completer ? `<span class="assignee-pill" style="background:${COLOR_MAP[completer.color] || COLOR_MAP.gray}15; color:${COLOR_MAP[completer.color] || COLOR_MAP.gray};">✓ ${escapeHtml(displayName(completer))} 完成</span>` : ''}
         </div>
       </div>
       ${(!member && !todo.done) ? '<button class="todo-claim-btn" style="margin-left:8px; padding:5px 12px; border:0.5px solid var(--green); border-radius:14px; background:transparent; color:var(--green); font-size:12px; font-weight:700; cursor:pointer; font-family:inherit; flex-shrink:0;">我认领</button>' : ''}
@@ -2363,9 +2426,10 @@
         const t = lst.todos.find(x => x.id === todo.id);
         if (!t) return;
         const myId = getCurrentMemberId();
-        // 已存在我的成员则复用, 否则插入一个
+        // 已存在我的成员则复用, 否则插入一个（名字不用"我"，避免污染共享成员表）
         if (!lst.members.find(m => m.id === myId)) {
-          lst.members.unshift({ id: myId, name: getMyName(), color: 'blue' });
+          const myName = getMyName();
+          lst.members.unshift({ id: myId, name: myName !== '我' ? myName : generateMemberName(lst), color: 'blue' });
         }
         t.assignee = myId;
         saveData();
@@ -2735,10 +2799,12 @@
   }
 
   function updateMyName(name) {
+    const n = name.trim();
+    if (!n) return; // 空名不写入，避免把"我"这类占位词写进共享成员表
     const myId = getCurrentMemberId();
     Object.values(state.lists).forEach(list => {
       const me = list.members.find(m => m.id === myId);
-      if (me) me.name = name.trim() || '我';
+      if (me) me.name = n;
     });
     saveData();
     render();
@@ -2970,7 +3036,7 @@
     const list = getCurrentList();
     const rows = hist.slice(-8).reverse().map(h => {
       const m = (list.members || []).find(x => x.id === h.by);
-      const name = m ? m.name : '成员';
+      const name = displayName(m);
       const act = ACT_TEXT[h.act] || h.act;
       return `<div style="padding:7px 0; border-bottom:0.5px solid var(--separator); font-size:13px; line-height:1.5;">
         <div style="display:flex; justify-content:space-between; gap:8px;">
@@ -3033,8 +3099,8 @@
       const chip = document.createElement('div');
       chip.className = 'member-chip' + (selectedAssignee === m.id ? ' active' : '');
       chip.innerHTML = `
-        <div class="chip-avatar" style="background:${COLOR_MAP[m.color] || COLOR_MAP.gray};">${escapeHtml(m.name.charAt(0))}</div>
-        <span>${escapeHtml(m.name)}</span>
+        <div class="chip-avatar" style="background:${COLOR_MAP[m.color] || COLOR_MAP.gray};">${escapeHtml(displayName(m).charAt(0))}</div>
+        <span>${escapeHtml(displayName(m))}</span>
       `;
       chip.addEventListener('click', () => {
         selectedAssignee = m.id;
