@@ -1,6 +1,6 @@
 // Service Worker for Family Todo PWA
 // 版本号：每次发布新版 index.html 时必须修改 (v2, v3, ...)
-const CACHE_NAME = 'family-todo-v15';
+const CACHE_NAME = 'family-todo-v16';
 const urlsToCache = [
   './',
   './index.html',
@@ -70,17 +70,24 @@ function swShowReminder(todo) {
 
 function checkReminders() {
   if (!reminderState || !Array.isArray(reminderState.todos)) return;
-  const now = Date.now();
-  const hour = reminderState.remindHour || 9;
-  reminderState.todos.forEach((todo) => {
-    if (!todo || todo.done || !todo.dueDate) return;
-    const fireAt = computeFireAt(todo.dueDate, hour);
-    if (fireAt === null || now < fireAt) return;
-    if (reminderState.notified && reminderState.notified[todo.id] === todo.dueDate) return;
-    swShowReminder(todo);
-    if (!reminderState.notified) reminderState.notified = {};
-    reminderState.notified[todo.id] = todo.dueDate;
-  });
+  // 页面当前可见时本轮跳过（页面侧 setTimeout/toast 负责提醒），
+  // 避免 hidden→visible 切换的轮询窗口内双通道重复弹通知。
+  // 注意: notified 不写, 下一轮(页面不可见或已离开)仍可接续。
+  self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
+    const hasVisible = clientList.some((c) => c.visibilityState === 'visible');
+    if (hasVisible) return;
+    const now = Date.now();
+    const hour = reminderState.remindHour || 9;
+    reminderState.todos.forEach((todo) => {
+      if (!todo || todo.done || !todo.dueDate) return;
+      const fireAt = computeFireAt(todo.dueDate, hour);
+      if (fireAt === null || now < fireAt) return;
+      if (reminderState.notified && reminderState.notified[todo.id] === todo.dueDate) return;
+      swShowReminder(todo);
+      if (!reminderState.notified) reminderState.notified = {};
+      reminderState.notified[todo.id] = todo.dueDate;
+    });
+  }).catch(() => {});
 }
 
 self.addEventListener('message', (event) => {

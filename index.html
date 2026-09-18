@@ -1988,33 +1988,68 @@
     }
   }
 
-  function fireNotification(todo, listName) {
-    if (!('Notification' in window)) return;
-    if (Notification.permission !== 'granted') return;
-    if (document.visibilityState === 'visible') return; // 页面已可见, 让 toast 承担
-    const title = '清单提醒：' + (todo.text || '待办');
-    const body = '截止日：' + formatDate(todo.dueDate) + (listName ? ' · ' + listName : '');
-    const opts = {
-      body: body,
-      tag: 'todo-' + todo.id,
-      renotify: true,
-      requireInteraction: false
-    };
-    // 优先通过 Service Worker 弹通知: iOS PWA (standalone) 下 new Notification() 不可用,
-    // registration.showNotification() 是唯一可靠途径, 且支持 notificationclick 聚焦
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.getRegistration()
-        .then((reg) => {
-          if (reg && reg.showNotification) {
-            reg.showNotification(title, opts);
-          } else {
-            fallbackNotification(title, opts);
-          }
-        })
-        .catch(() => fallbackNotification(title, opts));
-    } else {
-      fallbackNotification(title, opts);
+  // batch: [{todo, listName}]。返回 true 表示用户已被有效提醒（系统通知已弹或页面内 toast 已展示）；
+  // 返回 false（页面不可见且无通知权限）时不 markNotified，待页面回前台后由补提醒逻辑用 toast 兜底。
+  function fireNotification(batch) {
+    if (!batch || !batch.length) return false;
+    const first = batch[0];
+    // 1) 页面可见: 应用内聚合提示，保证开着 App 时"到点必有提醒"
+    //    （toast 是单例元素，多条连续弹会相互覆盖，必须聚合为一条）
+    if (document.visibilityState === 'visible') {
+      if (batch.length > 1) {
+        const names = batch.slice(0, 3).map(b => (b.todo.text || '待办')).join('、');
+        showToast('📌 ' + batch.length + ' 项任务到截止提醒：' + names + (batch.length > 3 ? ' 等' : ''), null, 6000);
+      } else {
+        showToast('📌 今日到期：' + (first.todo.text || '待办') + (first.listName ? ' · ' + first.listName : ''), null, 5000);
+      }
+      return true;
     }
+    // 2) 页面不可见但无系统通知能力: 暂不标记, 回前台后补提醒 toast 兜底
+    if (!('Notification' in window) || Notification.permission !== 'granted') return false;
+    // 3) 页面不可见 + 有权限: 系统通知逐条弹出（可堆叠，不会相互覆盖）
+    batch.forEach(({ todo, listName }) => {
+      const title = '清单提醒：' + (todo.text || '待办');
+      const body = '截止日：' + formatDate(todo.dueDate) + (listName ? ' · ' + listName : '');
+      const opts = {
+        body: body,
+        tag: 'todo-' + todo.id,
+        renotify: true,
+        requireInteraction: false
+      };
+      // 优先通过 Service Worker 弹通知: iOS PWA (standalone) 下 new Notification() 不可用,
+      // registration.showNotification() 是唯一可靠途径, 且支持 notificationclick 聚焦
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistration()
+          .then((reg) => {
+            if (reg && reg.showNotification) {
+              reg.showNotification(title, opts);
+            } else {
+              fallbackNotification(title, opts);
+            }
+          })
+          .catch(() => fallbackNotification(title, opts));
+      } else {
+        fallbackNotification(title, opts);
+      }
+    });
+    return true;
+  }
+
+  // 聚合触发窗口: 同一时刻到期的多个任务（如都截止今天、同一提醒钟点）
+  // 在 250ms 内合并为一批展示, 避免单条 toast 被后续 toast 覆盖
+  let pendingFires = [];
+  let pendingFireTimer = null;
+  function queueFire(todo, listName) {
+    pendingFires.push({ todo, listName });
+    if (pendingFireTimer) return;
+    pendingFireTimer = setTimeout(() => {
+      pendingFireTimer = null;
+      const batch = pendingFires;
+      pendingFires = [];
+      if (fireNotification(batch)) {
+        batch.forEach(({ todo }) => markNotified(todo.id, todo.dueDate));
+      }
+    }, 250);
   }
 
   function fallbackNotification(title, opts) {
@@ -2055,11 +2090,10 @@
       fireAt.setHours(remindHour, 0, 0, 0);
       const delay = fireAt.getTime() - now.getTime();
 
-      // 已过期 (今天提醒时间之前) 且未通知过 -> 立即补提醒一次
+      // 已过期 (今天提醒时间之前) 且未通知过 -> 进聚合队列补提醒
       if (delay <= 0) {
         if (!wasNotified(todo.id, todo.dueDate)) {
-          fireNotification(todo, listName);
-          markNotified(todo.id, todo.dueDate);
+          queueFire(todo, listName);
         }
         return;
       }
@@ -2068,7 +2102,10 @@
       if (wasNotified(todo.id, todo.dueDate)) return;
 
       try {
-        const tid = setTimeout(() => {
+        // setTimeout 32位上限约24.8天: 更远的定时分多段挂载并在触发时校验到点时间,
+        // 避免月度循环任务被截断为24.8天而提前误报
+        const MAX_TIMEOUT = 0x7fffffff;
+        const fire = () => {
           if (!state || !state.lists) return;
           // 再次校验任务是否仍存在、是否未完成
           let stillExists = false;
@@ -2079,10 +2116,19 @@
             });
           });
           if (!stillExists) return;
-          fireNotification(todo, listName);
-          markNotified(todo.id, todo.dueDate);
-        }, Math.min(delay, 0x7fffffff));
-        REMINDER_TIMEOUTS.push(tid);
+          queueFire(todo, listName);
+        };
+        const arm = (ms) => {
+          const tid = setTimeout(() => {
+            if (Date.now() >= fireAt.getTime() - 50) {
+              fire();
+            } else {
+              arm(fireAt.getTime() - Date.now()); // 未到点(被截断的分段) -> 重挂剩余时长
+            }
+          }, Math.min(ms, MAX_TIMEOUT));
+          REMINDER_TIMEOUTS.push(tid);
+        };
+        arm(delay);
       } catch (e) {}
     });
 
