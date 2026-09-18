@@ -3,7 +3,10 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<!-- 不加 viewport-fit=cover: standalone 模式下 cover 会把内容顶到状态栏后面,
+     而 env(safe-area-inset-top) 在 PWA webview 中常返回 0 (iOS WebKit / Android Chrome 均有此坑),
+     导致导航栏被状态栏遮挡。默认 contain 模式系统自动留出状态栏区域, 无需手动避让 -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="家庭待办">
@@ -388,9 +391,9 @@
   }
   .todo-item {
     display: flex;
-    align-items: flex-start;
-    padding: 14px 16px;
-    gap: 14px;
+    align-items: center;
+    padding: 13px 16px;
+    gap: 12px;
     border-bottom: 0.5px solid var(--separator);
     cursor: pointer;
     transition: background 0.15s;
@@ -439,27 +442,36 @@
     box-shadow: 0 2px 8px rgba(255, 59, 48, 0.4);
   }
 
-  .todo-body { flex: 1; min-width: 0; }
+  /* 单行布局: 优先级点+文字+负责人 在左, 重复/日期/完成人 在右 */
+  .todo-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
   .todo-text {
+    flex: 0 1 auto;
+    min-width: 0;
     font-size: 16px;
     font-weight: 500;
-    word-break: break-word;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     transition: color 0.25s ease;
+  }
+  .todo-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
   }
   .todo-item.done .todo-text {
     color: var(--text-tertiary);
     text-decoration: line-through;
     text-decoration-color: var(--text-tertiary);
     font-weight: 400;
-  }
-  .todo-meta {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 6px;
-    font-size: 12px;
-    color: var(--text-secondary);
-    flex-wrap: wrap;
   }
   .priority-indicator {
     width: 6px;
@@ -482,20 +494,45 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
+    flex-shrink: 0;
   }
   @media (prefers-color-scheme: dark) {
     .assignee-pill { background: var(--surface-elevated); }
   }
 
-  .due-date {
-    display: flex;
+  .due-badge {
+    flex-shrink: 0;
+    display: inline-flex;
     align-items: center;
-    gap: 3px;
-  }
-  .due-date.overdue { 
-    color: var(--red); 
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 99px;
+    font-size: 11px;
     font-weight: 600;
+    background: var(--gray5);
+    color: var(--text-secondary);
+    white-space: nowrap;
   }
+  .due-badge.today {
+    background: rgba(0, 122, 255, 0.12);
+    color: var(--blue);
+  }
+  .due-badge.overdue {
+    background: rgba(255, 59, 48, 0.12);
+    color: var(--red);
+  }
+  .todo-item.done .due-badge {
+    background: var(--gray5);
+    color: var(--text-tertiary);
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+  }
+  @media (prefers-color-scheme: dark) {
+    .due-badge { background: var(--surface-elevated); }
+    .due-badge.today { background: rgba(10, 132, 255, 0.22); }
+    .due-badge.overdue { background: rgba(255, 69, 58, 0.22); }
+  }
+  .todo-completed-by { flex-shrink: 0; }
 
   .swipe-actions {
     position: absolute;
@@ -2586,16 +2623,30 @@
     const dueDateText = todo.dueDate ? formatDate(todo.dueDate) : '';
     const isOverdue = todo.dueDate && !todo.done && new Date(todo.dueDate) < new Date(new Date().toDateString());
 
+    // 日期徽章: 今天蓝色 / 逾期红色("逾期 N 天") / 其他灰色(已完成不显示)
+    let dueBadgeHtml = '';
+    if (dueDateText && !todo.done) {
+      let badgeCls = '', badgeText = dueDateText;
+      if (isOverdue) {
+        const diffDays = Math.floor((new Date(new Date().toDateString()) - new Date(todo.dueDate)) / 86400000);
+        badgeText = `逾期 ${Math.max(diffDays, 1)} 天`;
+        badgeCls = 'overdue';
+      } else if (dueDateText === '今天') {
+        badgeCls = 'today';
+      }
+      dueBadgeHtml = `<span class="due-badge ${badgeCls}">📅 ${badgeText}</span>`;
+    }
+
     el.innerHTML = `
       <div class="todo-checkbox ${todo.done ? 'checked' : ''}"></div>
       <div class="todo-body">
+        <span class="priority-indicator priority-${todo.priority}"></span>
         <div class="todo-text">${escapeHtml(todo.text)}</div>
-        <div class="todo-meta">
-          <span class="priority-indicator priority-${todo.priority}"></span>
-          ${member ? `<span class="assignee-pill" data-assignee="${escapeHtml(member.id)}" style="background: ${COLOR_MAP[member.color]}15; color: ${COLOR_MAP[member.color]}; cursor:pointer;" title="点击筛选 TA 的任务"><span style="width:6px;height:6px;border-radius:50%;background:${COLOR_MAP[member.color]};display:inline-block;"></span>${escapeHtml(displayName(member))}</span>` : '<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">⚑ 待认领</span>'}
-          ${dueDateText ? `<span class="due-date ${isOverdue ? 'overdue' : ''}">📅 ${dueDateText}</span>` : ''}
-          ${todo.recurring && todo.recurring.type ? `<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">🔁 ${({daily:'每天',weekly:'每周',monthly:'每月',yearly:'每年'})[todo.recurring.type] || '重复'}${todo.recurring.interval > 1 ? '·每 ' + todo.recurring.interval + ({daily:' 天',weekly:' 周',monthly:' 月',yearly:' 年'})[todo.recurring.type] : ''}</span>` : ''}
-          ${completer ? `<span class="assignee-pill" style="background:${COLOR_MAP[completer.color] || COLOR_MAP.gray}15; color:${COLOR_MAP[completer.color] || COLOR_MAP.gray};">✓ ${escapeHtml(displayName(completer))} 完成</span>` : ''}
+        ${member ? `<span class="assignee-pill" data-assignee="${escapeHtml(member.id)}" style="background: ${COLOR_MAP[member.color]}15; color: ${COLOR_MAP[member.color]}; cursor:pointer;" title="点击筛选 TA 的任务"><span style="width:6px;height:6px;border-radius:50%;background:${COLOR_MAP[member.color]};display:inline-block;"></span>${escapeHtml(displayName(member))}</span>` : ''}
+        <div class="todo-right">
+          ${!todo.done && todo.recurring && todo.recurring.type ? `<span class="assignee-pill" style="background: var(--surface-elevated); color: var(--text-secondary);">🔁 ${({daily:'每天',weekly:'每周',monthly:'每月',yearly:'每年'})[todo.recurring.type] || '重复'}${todo.recurring.interval > 1 ? '·每 ' + todo.recurring.interval + ({daily:' 天',weekly:' 周',monthly:' 月',yearly:' 年'})[todo.recurring.type] : ''}</span>` : ''}
+          ${dueBadgeHtml}
+          ${completer ? `<span class="assignee-pill todo-completed-by" style="background:${COLOR_MAP[completer.color] || COLOR_MAP.gray}15; color:${COLOR_MAP[completer.color] || COLOR_MAP.gray};">✓ ${escapeHtml(displayName(completer))} 完成</span>` : ''}
         </div>
       </div>
       ${(!member && !todo.done) ? '<button class="todo-claim-btn" style="margin-left:8px; padding:5px 12px; border:0.5px solid var(--green); border-radius:14px; background:transparent; color:var(--green); font-size:12px; font-weight:700; cursor:pointer; font-family:inherit; flex-shrink:0;">我认领</button>' : ''}
